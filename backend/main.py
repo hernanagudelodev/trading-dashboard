@@ -121,6 +121,47 @@ def get_positions():
     }
 
 
+@app.get("/api/equity")
+def get_equity(days: int = 90):
+    """
+    Serie de patrimonio (NLV) para la curva + resumen del periodo.
+    days: ventana hacia atras (default 90). La curva usa todos los snapshots
+    del rango; el resumen compara el primero contra el ultimo.
+    """
+    rows = query("""
+        SELECT snapshot_at, net_liquidating_value AS nlv, cash_balance
+        FROM account_snapshots
+        WHERE snapshot_at >= NOW() - (%s || \' days\')::interval
+        ORDER BY snapshot_at ASC
+    """, (days,))
+
+    if not rows:
+        return {"series": [], "summary": None}
+
+    series = [
+        {"t": r["snapshot_at"].isoformat(), "nlv": float(r["nlv"])}
+        for r in rows
+    ]
+    first_nlv = float(rows[0]["nlv"])
+    last_nlv  = float(rows[-1]["nlv"])
+    change    = last_nlv - first_nlv
+    change_pct = (change / first_nlv * 100) if first_nlv else 0
+    nlvs = [float(r["nlv"]) for r in rows]
+
+    summary = {
+        "start_at": rows[0]["snapshot_at"].isoformat(),
+        "end_at":   rows[-1]["snapshot_at"].isoformat(),
+        "start_nlv": round(first_nlv, 2),
+        "end_nlv":   round(last_nlv, 2),
+        "change":    round(change, 2),
+        "change_pct": round(change_pct, 2),
+        "min_nlv":   round(min(nlvs), 2),
+        "max_nlv":   round(max(nlvs), 2),
+        "points":    len(series),
+    }
+    return {"series": series, "summary": summary}
+
+
 @app.get("/api/health")
 def health():
     """Ping simple para saber que el backend vive."""

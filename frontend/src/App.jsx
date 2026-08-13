@@ -122,7 +122,92 @@ function Book({ book }) {
   );
 }
 
+function EquityCurve() {
+  const [eq, setEq] = useState(null);
+  const [error, setError] = useState(null);
+  const [days, setDays] = useState(90);
+
+  useEffect(() => {
+    fetch(`${API}/api/equity?days=${days}`)
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then((d) => { setEq(d); setError(null); })
+      .catch((e) => setError(e.message));
+  }, [days]);
+
+  if (error) return <div className="state">No se pudo cargar el patrimonio ({error}).</div>;
+  if (!eq) return <div className="state">Cargando patrimonio…</div>;
+  if (!eq.series.length) return <div className="state">Sin datos de patrimonio en el periodo.</div>;
+
+  const s = eq.summary;
+  const pos = s.change >= 0;
+
+  // Escalar la curva a un viewBox. Padding para que no toque bordes.
+  const W = 1000, H = 320, PAD = 24;
+  const xs = eq.series.map((_, i) => i);
+  const ys = eq.series.map((p) => p.nlv);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const rangeY = maxY - minY || 1;
+  const px = (i) => PAD + (i / (eq.series.length - 1 || 1)) * (W - 2 * PAD);
+  const py = (v) => PAD + (1 - (v - minY) / rangeY) * (H - 2 * PAD);
+
+  const line = eq.series.map((p, i) => `${i === 0 ? "M" : "L"} ${px(i).toFixed(1)} ${py(p.nlv).toFixed(1)}`).join(" ");
+  const area = `${line} L ${px(eq.series.length - 1).toFixed(1)} ${H - PAD} L ${px(0).toFixed(1)} ${H - PAD} Z`;
+  const stroke = pos ? "#3fb950" : "#f85149";
+
+  const fmtDate = (iso) => iso.slice(5, 10);
+
+  return (
+    <>
+      <div className="pulse">
+        <div className="pulse-card">
+          <div className="pulse-label">Cambio del periodo</div>
+          <div className="pulse-value" style={{ color: pos ? "#3fb950" : "#f85149" }}>
+            {signed(s.change)}
+          </div>
+          <div className="pulse-sub">{s.change_pct >= 0 ? "+" : ""}{fmt(s.change_pct, 1)}% en {s.points} puntos</div>
+        </div>
+        <div className="pulse-card">
+          <div className="pulse-label">NLV actual</div>
+          <div className="pulse-value">{money(s.end_nlv, 0)}</div>
+          <div className="pulse-sub">desde {money(s.start_nlv, 0)}</div>
+        </div>
+        <div className="pulse-card pulse-card--wide">
+          <div className="pulse-label">Rango del periodo</div>
+          <div className="pulse-value" style={{ fontSize: "1.4rem" }}>
+            {money(s.min_nlv, 0)} <span className="pulse-of">—</span> {money(s.max_nlv, 0)}
+          </div>
+          <div className="range-picker">
+            {[30, 60, 90].map((d) => (
+              <button key={d} className={days === d ? "chip active" : "chip"} onClick={() => setDays(d)}>
+                {d}d
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="chart-wrap">
+        <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="chart">
+          <defs>
+            <linearGradient id="area-grad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={stroke} stopOpacity="0.22" />
+              <stop offset="100%" stopColor={stroke} stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          <path d={area} fill="url(#area-grad)" />
+          <path d={line} fill="none" stroke={stroke} strokeWidth="2" vectorEffect="non-scaling-stroke" />
+        </svg>
+        <div className="chart-axis">
+          <span>{fmtDate(s.start_at)}</span>
+          <span>{fmtDate(s.end_at)}</span>
+        </div>
+      </div>
+    </>
+  );
+}
+
 export default function Dashboard() {
+  const [view, setView] = useState("positions");
   const [tab, setTab] = useState("live");
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
@@ -139,23 +224,11 @@ export default function Dashboard() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, 60000); // refresca cada 60s
+    const t = setInterval(load, 60000);
     return () => clearInterval(t);
   }, []);
 
-  if (error) return (
-    <div className="app"><style>{CSS}</style>
-      <div className="state">No se pudo conectar al backend ({error}).<br/>
-      ¿Está corriendo uvicorn en :8000?</div>
-    </div>
-  );
-  if (!data) return (
-    <div className="app"><style>{CSS}</style>
-      <div className="state">Cargando cartera…</div>
-    </div>
-  );
-
-  const book = data[tab];
+  const book = data ? data[tab] : null;
 
   return (
     <div className="app">
@@ -165,27 +238,41 @@ export default function Dashboard() {
           <span className="brand-mark" />
           <span className="brand-name">bull<span className="brand-accent">desk</span></span>
         </div>
+        <nav className="nav">
+          <button className={view === "positions" ? "navbtn active" : "navbtn"} onClick={() => setView("positions")}>posiciones</button>
+          <button className={view === "equity" ? "navbtn active" : "navbtn"} onClick={() => setView("equity")}>patrimonio</button>
+        </nav>
         <div className="capital">
           <span className="capital-label">capital</span>
-          <span className="capital-value mono">{money(data.capital, 2)}</span>
-          <span className="capital-time">· {data.capital_at ? data.capital_at.slice(11) : "—"} sync</span>
+          <span className="capital-value mono">{data ? money(data.capital, 2) : "—"}</span>
         </div>
       </header>
 
-      <div className="tabs">
-        <button className={tab === "live" ? "tab active" : "tab"} onClick={() => setTab("live")}>
-          <span className="dot" style={{ background: tab === "live" ? "#f85149" : "#3d444d" }} />
-          live · real
-        </button>
-        <button className={tab === "paper" ? "tab active" : "tab"} onClick={() => setTab("paper")}>
-          <span className="dot" style={{ background: tab === "paper" ? "#58a6ff" : "#3d444d" }} />
-          paper · sim
-        </button>
-      </div>
+      {view === "positions" && (
+        <>
+          <div className="tabs">
+            <button className={tab === "live" ? "tab active" : "tab"} onClick={() => setTab("live")}>
+              <span className="dot" style={{ background: tab === "live" ? "#f85149" : "#3d444d" }} />
+              live · real
+            </button>
+            <button className={tab === "paper" ? "tab active" : "tab"} onClick={() => setTab("paper")}>
+              <span className="dot" style={{ background: tab === "paper" ? "#58a6ff" : "#3d444d" }} />
+              paper · sim
+            </button>
+          </div>
+          <main className="content">
+            {error && <div className="state">No se pudo conectar al backend ({error}).<br/>¿Está corriendo uvicorn en :8000?</div>}
+            {!error && !data && <div className="state">Cargando cartera…</div>}
+            {!error && data && <Book book={book} />}
+          </main>
+        </>
+      )}
 
-      <main className="content">
-        <Book book={book} />
-      </main>
+      {view === "equity" && (
+        <main className="content">
+          <EquityCurve />
+        </main>
+      )}
 
       <footer className="foot">
         <span>datos del último sync del monitor · máx 5 min de antigüedad</span>
@@ -283,6 +370,18 @@ tbody tr:hover { background: var(--panel-2) !important; }
 }
 .legend { display: flex; gap: 1rem; }
 .legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
+
+.nav { display: flex; gap: 0.3rem; }
+.navbtn { background: transparent; border: none; color: var(--dim); font-size: 0.9rem; padding: 0.4rem 0.9rem; border-radius: 7px; cursor: pointer; font-family: inherit; transition: all 0.15s; }
+.navbtn:hover { color: var(--text); }
+.navbtn.active { color: var(--text); background: var(--panel-2); }
+.chart-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.2rem; }
+.chart { width: 100%; height: 320px; display: block; }
+.chart-axis { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 0.72rem; color: var(--dim); margin-top: 0.5rem; padding: 0 0.2rem; }
+.range-picker { display: flex; gap: 0.35rem; margin-top: 0.7rem; }
+.chip { background: var(--panel-2); border: 1px solid var(--line); color: var(--dim); font-family: var(--mono); font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 6px; cursor: pointer; transition: all 0.15s; }
+.chip:hover { color: var(--text); }
+.chip.active { background: #1f6feb22; border-color: #1f6feb; color: #58a6ff; }
 .state { padding: 4rem 2rem; text-align: center; color: var(--dim); font-size: 0.95rem; line-height: 1.7; }
 
 @media (max-width: 720px) {
