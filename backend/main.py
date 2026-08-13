@@ -21,9 +21,13 @@ app = FastAPI(title="Trading Dashboard API", version="0.1.0")
 
 # CORS: el front (React) corre en otro puerto (5173) y necesita permiso para
 # consultar este backend (8000). En dev abrimos todo; en prod se restringe.
+# CORS: en dev abrimos todo; en prod se restringe a la URL del frontend via
+# env var FRONTEND_ORIGIN (separar varias con coma si hiciera falta).
+_origins_env = os.getenv("FRONTEND_ORIGIN", "*")
+_origins = ["*"] if _origins_env == "*" else [o.strip() for o in _origins_env.split(",")]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
