@@ -162,6 +162,106 @@ def get_equity(days: int = 90):
     return {"series": series, "summary": summary}
 
 
+# close_reasons que NO cuentan: trades del sistema viejo o correcciones manuales
+# que contaminan la expectativa. Mismo criterio que check_closed.py.
+CLOSED_EXCLUDE = ("PRE_RULES", "INVALID_STRIKES", "MANUAL_PRICE_FIX")
+
+
+def _closed_libro(table, since):
+    rows = query(f"""
+        SELECT ticker, strategy, close_reason, gross_pnl, pnl_pct, closed_at
+        FROM {table}
+        WHERE UPPER(status) = 'CLOSED'
+          AND (close_reason IS NULL OR close_reason NOT IN %s)
+          AND closed_at >= %s
+        ORDER BY closed_at DESC
+    """, (CLOSED_EXCLUDE, since))
+
+    trades = []
+    wins = losses = 0
+    total_pnl = 0.0
+    sum_win = sum_loss = 0.0
+    for r in rows:
+        pnl = float(r["gross_pnl"]) if r["gross_pnl"] is not None else 0.0
+        total_pnl += pnl
+        if pnl >= 0:
+            wins += 1; sum_win += pnl
+        else:
+            losses += 1; sum_loss += pnl
+        trades.append({
+            "ticker": r["ticker"],
+            "strategy": r["strategy"],
+            "close_reason": r["close_reason"],
+            "pnl": round(pnl, 2),
+            "pnl_pct": float(r["pnl_pct"]) if r["pnl_pct"] is not None else None,
+            "closed_at": r["closed_at"].isoformat() if r["closed_at"] else None,
+        })
+
+    n = len(trades)
+    avg_win  = sum_win / wins if wins else 0
+    avg_loss = sum_loss / losses if losses else 0
+    # Expectativa por trade = (win% * gan_prom) + (loss% * perd_prom)
+    expectancy = ((wins/n)*avg_win + (losses/n)*avg_loss) if n else 0
+
+    summary = {
+        "count": n,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / n * 100, 0) if n else 0,
+        "total_pnl": round(total_pnl, 2),
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "expectancy": round(expectancy, 2),
+    }
+    return {"trades": trades, "summary": summary}
+
+
+@app.get("/api/closed")
+def get_closed(since: str = "2026-06-20"):
+    """
+    Trades cerrados de ambos libros desde 'since' (default 2026-06-20, post-reglas).
+    Excluye trades del sistema viejo. Devuelve trades + metricas (win rate,
+    expectativa) por libro.
+    """
+    return {
+        "since": since,
+        "live":  _closed_libro("positions", since),
+        "paper": _closed_libro("paper_positions", since),
+    }
+
+
+@app.get("/api/runs")
+def get_runs(limit: int = 30):
+    """
+    Ultimos runs del auto_run (que decidio el LLM y por que). Lee auto_run_logs.
+    En def los runs son mode='def' (un run cubre ambos libros).
+    """
+    rows = query("""
+        SELECT run_at, slot, verdict, vix, opened, closed, errors,
+               summary, no_trade_reason, run_time_sec, mode
+        FROM auto_run_logs
+        ORDER BY run_at DESC
+        LIMIT %s
+    """, (limit,))
+
+    runs = []
+    for r in rows:
+        runs.append({
+            "run_at": r["run_at"].isoformat() if r["run_at"] else None,
+            "slot": r["slot"],
+            "verdict": r["verdict"],
+            "vix": float(r["vix"]) if r["vix"] is not None else None,
+            "opened": r["opened"],
+            "closed": r["closed"],
+            "errors": r["errors"],
+            "summary": r["summary"],
+            "no_trade_reason": r["no_trade_reason"],
+            "run_time_sec": r["run_time_sec"],
+            "mode": r["mode"],
+        })
+    return {"runs": runs}
+
+
 @app.get("/api/health")
 def health():
     """Ping simple para saber que el backend vive."""

@@ -206,6 +206,173 @@ function EquityCurve() {
   );
 }
 
+function ClosedTrades() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [tab, setTab] = useState("live");
+
+  useEffect(() => {
+    fetch(`${API}/api/closed`)
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then((d) => { setData(d); setError(null); })
+      .catch((e) => setError(e.message));
+  }, []);
+
+  if (error) return <div className="state">No se pudo cargar el historial ({error}).</div>;
+  if (!data) return <div className="state">Cargando historial…</div>;
+
+  const book = data[tab];
+  const s = book.summary;
+  const pnlPos = s.total_pnl >= 0;
+  const expPos = s.expectancy >= 0;
+
+  return (
+    <>
+      <div className="tabs">
+        <button className={tab === "live" ? "tab active" : "tab"} onClick={() => setTab("live")}>
+          <span className="dot" style={{ background: tab === "live" ? "#f85149" : "#3d444d" }} />
+          live · real
+        </button>
+        <button className={tab === "paper" ? "tab active" : "tab"} onClick={() => setTab("paper")}>
+          <span className="dot" style={{ background: tab === "paper" ? "#58a6ff" : "#3d444d" }} />
+          paper · sim
+        </button>
+      </div>
+
+      {s.count === 0 ? (
+        <div className="state">Sin trades cerrados en este libro desde {data.since}.</div>
+      ) : (
+      <>
+      <div className="pulse">
+        <div className="pulse-card">
+          <div className="pulse-label">Expectativa / trade</div>
+          <div className="pulse-value" style={{ color: expPos ? "#3fb950" : "#f85149" }}>
+            {signed(s.expectancy)}
+          </div>
+          <div className="pulse-sub">la métrica que importa</div>
+        </div>
+        <div className="pulse-card">
+          <div className="pulse-label">P&L total realizado</div>
+          <div className="pulse-value" style={{ color: pnlPos ? "#3fb950" : "#f85149" }}>
+            {signed(s.total_pnl)}
+          </div>
+          <div className="pulse-sub">{s.count} trades cerrados</div>
+        </div>
+        <div className="pulse-card pulse-card--wide">
+          <div className="pulse-label">Win rate</div>
+          <div className="pulse-value" style={{ fontSize: "1.5rem" }}>
+            {fmt(s.win_rate, 0)}% <span className="pulse-of">· {s.wins}G / {s.losses}P</span>
+          </div>
+          <div className="wl-bar">
+            <div className="wl-win" style={{ width: `${s.count ? (s.wins/s.count*100) : 0}%` }} />
+            <div className="wl-loss" style={{ width: `${s.count ? (s.losses/s.count*100) : 0}%` }} />
+          </div>
+          <div className="pulse-sub">gana {money(s.avg_win)} · pierde {money(s.avg_loss)}</div>
+        </div>
+      </div>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ticker</th>
+              <th>tipo</th>
+              <th>motivo</th>
+              <th className="num">P&L</th>
+              <th className="num">%</th>
+              <th>fecha</th>
+            </tr>
+          </thead>
+          <tbody>
+            {book.trades.map((t, i) => {
+              const pos = t.pnl >= 0;
+              return (
+                <tr key={i}>
+                  <td className="mono ticker">{t.ticker}</td>
+                  <td className="mono dim">{t.strategy}</td>
+                  <td className="mono dim reason">{t.close_reason || "—"}</td>
+                  <td className="mono num" style={{ color: pos ? "#3fb950" : "#f85149", fontWeight: 600 }}>
+                    {signed(t.pnl)}
+                  </td>
+                  <td className="mono num dim">{t.pnl_pct != null ? fmt(t.pnl_pct, 1) + "%" : "—"}</td>
+                  <td className="mono dim">{t.closed_at ? t.closed_at.slice(0, 10) : "—"}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      </>
+      )}
+    </>
+  );
+}
+
+function Runs() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const load = () => fetch(`${API}/api/runs`)
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then((d) => { setData(d); setError(null); })
+      .catch((e) => setError(e.message));
+    load();
+    const t = setInterval(load, 60000);
+    return () => clearInterval(t);
+  }, []);
+
+  if (error) return <div className="state">No se pudieron cargar los runs ({error}).</div>;
+  if (!data) return <div className="state">Cargando runs…</div>;
+  if (!data.runs.length) return <div className="state">Sin runs registrados todavía.</div>;
+
+  const verdictColor = (v) => {
+    if (!v) return "#7d8590";
+    const u = v.toUpperCase();
+    if (u.includes("FAVORABLE") || u.includes("ALCISTA")) return "#3fb950";
+    if (u.includes("CAUTO") || u.includes("MIXTO") || u.includes("NEUTRAL")) return "#d29922";
+    if (u.includes("ADVERSO") || u.includes("BAJISTA") || u.includes("RIESGO")) return "#f85149";
+    return "#58a6ff";
+  };
+
+  const fmtWhen = (iso) => {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    return d.toLocaleString("es", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  };
+
+  return (
+    <div className="runs">
+      {data.runs.map((r, i) => {
+        const vc = verdictColor(r.verdict);
+        return (
+          <div className="run-card" key={i} style={{ borderLeftColor: vc }}>
+            <div className="run-head">
+              <div className="run-when">
+                <span className="run-slot">{r.slot || "run"}</span>
+                <span className="run-time">{fmtWhen(r.run_at)}</span>
+              </div>
+              <div className="run-verdict" style={{ color: vc }}>{r.verdict || "—"}</div>
+            </div>
+            <div className="run-metrics">
+              {r.vix != null && <span className="run-chip">VIX {r.vix.toFixed(1)}</span>}
+              <span className="run-chip" style={{ color: r.opened ? "#3fb950" : "#7d8590" }}>
+                {r.opened || 0} abiertos
+              </span>
+              {r.closed > 0 && <span className="run-chip" style={{ color: "#58a6ff" }}>{r.closed} cerrados</span>}
+              {r.errors > 0 && <span className="run-chip" style={{ color: "#f85149" }}>{r.errors} errores</span>}
+              {r.run_time_sec != null && <span className="run-chip dim">{r.run_time_sec}s</span>}
+            </div>
+            {(r.summary || r.no_trade_reason) && (
+              <div className="run-reason">{r.summary || r.no_trade_reason}</div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const [view, setView] = useState("positions");
   const [tab, setTab] = useState("live");
@@ -241,6 +408,8 @@ export default function Dashboard() {
         <nav className="nav">
           <button className={view === "positions" ? "navbtn active" : "navbtn"} onClick={() => setView("positions")}>posiciones</button>
           <button className={view === "equity" ? "navbtn active" : "navbtn"} onClick={() => setView("equity")}>patrimonio</button>
+          <button className={view === "closed" ? "navbtn active" : "navbtn"} onClick={() => setView("closed")}>cerrados</button>
+          <button className={view === "runs" ? "navbtn active" : "navbtn"} onClick={() => setView("runs")}>runs</button>
         </nav>
         <div className="capital">
           <span className="capital-label">capital</span>
@@ -271,6 +440,18 @@ export default function Dashboard() {
       {view === "equity" && (
         <main className="content">
           <EquityCurve />
+        </main>
+      )}
+
+      {view === "closed" && (
+        <main className="content">
+          <ClosedTrades />
+        </main>
+      )}
+
+      {view === "runs" && (
+        <main className="content">
+          <Runs />
         </main>
       )}
 
@@ -371,6 +552,22 @@ tbody tr:hover { background: var(--panel-2) !important; }
 .legend { display: flex; gap: 1rem; }
 .legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
 
+
+.wl-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; margin: 0.7rem 0 0.5rem; background: var(--panel-2); }
+.wl-win { background: #3fb950; }
+.wl-loss { background: #f85149; }
+.reason { font-size: 0.76rem; }
+
+.runs { display: flex; flex-direction: column; gap: 0.7rem; }
+.run-card { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--dim); border-radius: 8px; padding: 0.9rem 1.1rem; }
+.run-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.5rem; }
+.run-when { display: flex; align-items: baseline; gap: 0.6rem; }
+.run-slot { font-family: var(--mono); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); background: var(--panel-2); padding: 0.15rem 0.5rem; border-radius: 4px; }
+.run-time { font-size: 0.8rem; color: var(--dim); }
+.run-verdict { font-weight: 700; font-size: 0.9rem; letter-spacing: -0.01em; }
+.run-metrics { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+.run-chip { font-family: var(--mono); font-size: 0.75rem; background: var(--panel-2); padding: 0.2rem 0.55rem; border-radius: 5px; }
+.run-reason { font-size: 0.84rem; color: #b3bcc7; line-height: 1.5; border-top: 1px solid var(--line); padding-top: 0.55rem; margin-top: 0.3rem; }
 .nav { display: flex; gap: 0.3rem; }
 .navbtn { background: transparent; border: none; color: var(--dim); font-size: 0.9rem; padding: 0.4rem 0.9rem; border-radius: 7px; cursor: pointer; font-family: inherit; transition: all 0.15s; }
 .navbtn:hover { color: var(--text); }
