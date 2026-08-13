@@ -1,7 +1,32 @@
 import React, { useState, useEffect } from "react";
 
 // El backend FastAPI sirve los datos reales. En dev corre en :8000.
-const API = "http://localhost:8000";
+// En produccion (Railway) esto apunta al backend desplegado — se toma de la
+// variable de entorno de Vite, con fallback a localhost para desarrollo.
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+// ── Token de sesion (persiste en localStorage) ──────────────────────────────
+const getToken = () => localStorage.getItem("bulldesk_token");
+const setToken = (t) => localStorage.setItem("bulldesk_token", t);
+const clearToken = () => localStorage.removeItem("bulldesk_token");
+
+// fetch que agrega el token y detecta sesion caida (401 -> limpia y recarga).
+async function authFetch(path) {
+  const token = getToken();
+  // Sin token no llamamos al backend: el gate de login se encarga. Evita el
+  // loop de 401 -> reload durante el login.
+  if (!token) throw new Error("Sin sesion");
+  const res = await fetch(`${API}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 401) {
+    // Habia token pero el backend lo rechazo (sesion caida / backend reiniciado).
+    clearToken();
+    throw new Error("Sesion expirada");
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -128,8 +153,7 @@ function EquityCurve() {
   const [days, setDays] = useState(90);
 
   useEffect(() => {
-    fetch(`${API}/api/equity?days=${days}`)
-      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+    authFetch(`/api/equity?days=${days}`)
       .then((d) => { setEq(d); setError(null); })
       .catch((e) => setError(e.message));
   }, [days]);
@@ -212,8 +236,7 @@ function ClosedTrades() {
   const [tab, setTab] = useState("live");
 
   useEffect(() => {
-    fetch(`${API}/api/closed`)
-      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+    authFetch(`/api/closed`)
       .then((d) => { setData(d); setError(null); })
       .catch((e) => setError(e.message));
   }, []);
@@ -313,8 +336,7 @@ function Runs() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    const load = () => fetch(`${API}/api/runs`)
-      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+    const load = () => authFetch(`/api/runs`)
       .then((d) => { setData(d); setError(null); })
       .catch((e) => setError(e.message));
     load();
@@ -373,27 +395,72 @@ function Runs() {
   );
 }
 
+function Login({ onOk }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = () => {
+    if (!pw) return;
+    setBusy(true); setErr(null);
+    fetch(`${API}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: pw }),
+    })
+      .then((r) => { if (!r.ok) throw new Error("Password incorrecta"); return r.json(); })
+      .then((d) => { setToken(d.token); onOk(); })
+      .catch((e) => { setErr(e.message); setBusy(false); });
+  };
+
+  return (
+    <div className="login">
+      <style>{CSS}</style>
+      <div className="login-card">
+        <div className="login-brand">
+          <span className="brand-mark" />
+          <span className="brand-name">bull<span className="brand-accent">desk</span></span>
+        </div>
+        <p className="login-hint">Panel de trading privado</p>
+        <input
+          type="password"
+          className="login-input"
+          placeholder="Contraseña"
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          autoFocus
+        />
+        {err && <div className="login-err">{err}</div>}
+        <button className="login-btn" onClick={submit} disabled={busy}>
+          {busy ? "Entrando…" : "Entrar"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function Dashboard() {
+  const [authed, setAuthed] = useState(!!getToken());
   const [view, setView] = useState("positions");
   const [tab, setTab] = useState("live");
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
 
   const load = () => {
-    fetch(`${API}/api/positions`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
+    authFetch(`/api/positions`)
       .then((d) => { setData(d); setError(null); })
       .catch((e) => setError(e.message));
   };
 
   useEffect(() => {
+    if (!authed) return;          // no cargar datos si no hay sesion
     load();
     const t = setInterval(load, 60000);
     return () => clearInterval(t);
-  }, []);
+  }, [authed]);
+
+  if (!authed) return <Login onOk={() => setAuthed(true)} />;
 
   const book = data ? data[tab] : null;
 
@@ -414,6 +481,7 @@ export default function Dashboard() {
         <div className="capital">
           <span className="capital-label">capital</span>
           <span className="capital-value mono">{data ? money(data.capital, 2) : "—"}</span>
+          <button className="logout" onClick={() => { clearToken(); setAuthed(false); }} title="Salir">⏻</button>
         </div>
       </header>
 
@@ -568,6 +636,19 @@ tbody tr:hover { background: var(--panel-2) !important; }
 .run-metrics { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
 .run-chip { font-family: var(--mono); font-size: 0.75rem; background: var(--panel-2); padding: 0.2rem 0.55rem; border-radius: 5px; }
 .run-reason { font-size: 0.84rem; color: #b3bcc7; line-height: 1.5; border-top: 1px solid var(--line); padding-top: 0.55rem; margin-top: 0.3rem; }
+
+.login { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--bg); }
+.login-card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 2.4rem 2.2rem; width: 340px; text-align: center; }
+.login-brand { display: flex; align-items: center; justify-content: center; gap: 0.6rem; margin-bottom: 0.4rem; }
+.login-hint { color: var(--dim); font-size: 0.82rem; margin-bottom: 1.6rem; }
+.login-input { width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 0.75rem 0.9rem; color: var(--text); font-size: 0.95rem; font-family: var(--mono); outline: none; transition: border 0.15s; }
+.login-input:focus { border-color: #3fb950; }
+.login-err { color: #f85149; font-size: 0.8rem; margin-top: 0.7rem; }
+.login-btn { width: 100%; margin-top: 1rem; background: #2ea043; border: none; color: white; padding: 0.75rem; border-radius: 8px; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+.login-btn:hover:not(:disabled) { background: #3fb950; }
+.login-btn:disabled { opacity: 0.6; cursor: default; }
+.logout { background: transparent; border: 1px solid var(--line); color: var(--dim); width: 30px; height: 30px; border-radius: 7px; cursor: pointer; margin-left: 0.8rem; font-size: 0.9rem; transition: all 0.15s; }
+.logout:hover { color: #f85149; border-color: #f85149; }
 .nav { display: flex; gap: 0.3rem; }
 .navbtn { background: transparent; border: none; color: var(--dim); font-size: 0.9rem; padding: 0.4rem 0.9rem; border-radius: 7px; cursor: pointer; font-family: inherit; transition: all 0.15s; }
 .navbtn:hover { color: var(--text); }

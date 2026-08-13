@@ -9,8 +9,12 @@ Correr:
 Docs interactivas:
     http://localhost:8000/docs
 """
-from fastapi import FastAPI
+import os
+import secrets
+import hmac
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from db import query
 
 app = FastAPI(title="Trading Dashboard API", version="0.1.0")
@@ -23,6 +27,49 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── AUTENTICACION (un solo usuario) ──────────────────────────────────────────
+# El password vive SOLO en el backend (env var DASHBOARD_PASSWORD). El frontend
+# nunca lo tiene: manda el password una vez a /api/login, el backend valida y
+# devuelve un token. Ese token se exige (header Authorization) en cada endpoint
+# de datos. Sin token valido -> 401, no salen datos.
+#
+# Para un solo usuario alcanza un token aleatorio en memoria: se genera al
+# arrancar y se compara. Si el servicio reinicia, el token cambia y hay que
+# re-loguear (una molestia menor, mas seguro). No necesita JWT ni DB de sesiones.
+
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+# Token de sesion: aleatorio por arranque del proceso.
+_SESSION_TOKEN = secrets.token_urlsafe(32)
+
+
+class LoginBody(BaseModel):
+    password: str
+
+
+@app.post("/api/login")
+def login(body: LoginBody):
+    """Valida el password contra la env var. Devuelve el token de sesion."""
+    if not DASHBOARD_PASSWORD:
+        raise HTTPException(500, "DASHBOARD_PASSWORD no configurada en el backend.")
+    # Comparacion en tiempo constante (evita timing attacks).
+    if not hmac.compare_digest(body.password, DASHBOARD_PASSWORD):
+        raise HTTPException(401, "Password incorrecta.")
+    return {"token": _SESSION_TOKEN}
+
+
+def require_auth(authorization: str = Header(None)):
+    """
+    Dependencia que exige el token en el header Authorization: Bearer <token>.
+    Cada endpoint de datos la usa. Sin token valido -> 401.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Falta el token. Inicia sesion.")
+    token = authorization.split(" ", 1)[1]
+    if not hmac.compare_digest(token, _SESSION_TOKEN):
+        raise HTTPException(401, "Token invalido o expirado. Inicia sesion de nuevo.")
+    return True
 
 
 def _capital_actual():
@@ -110,7 +157,7 @@ def _serializar_libro(table, capital):
 
 
 @app.get("/api/positions")
-def get_positions():
+def get_positions(_auth: bool = Depends(require_auth)):
     """Posiciones abiertas de ambos libros + exposicion + capital."""
     capital, snap_at = _capital_actual()
     return {
@@ -122,7 +169,7 @@ def get_positions():
 
 
 @app.get("/api/equity")
-def get_equity(days: int = 90):
+def get_equity(days: int = 90, _auth: bool = Depends(require_auth)):
     """
     Serie de patrimonio (NLV) para la curva + resumen del periodo.
     days: ventana hacia atras (default 90). La curva usa todos los snapshots
@@ -217,7 +264,7 @@ def _closed_libro(table, since):
 
 
 @app.get("/api/closed")
-def get_closed(since: str = "2026-06-20"):
+def get_closed(since: str = "2026-06-20", _auth: bool = Depends(require_auth)):
     """
     Trades cerrados de ambos libros desde 'since' (default 2026-06-20, post-reglas).
     Excluye trades del sistema viejo. Devuelve trades + metricas (win rate,
@@ -231,7 +278,7 @@ def get_closed(since: str = "2026-06-20"):
 
 
 @app.get("/api/runs")
-def get_runs(limit: int = 30):
+def get_runs(limit: int = 30, _auth: bool = Depends(require_auth)):
     """
     Ultimos runs del auto_run (que decidio el LLM y por que). Lee auto_run_logs.
     En def los runs son mode='def' (un run cubre ambos libros).
