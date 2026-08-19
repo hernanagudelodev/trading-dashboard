@@ -119,7 +119,49 @@ function PositionRow({ p }) {
   );
 }
 
+// Columnas ordenables: clave (campo del dato), etiqueta, y tipo de orden.
+// 'num' ordena numérico; 'str' alfabético. El semáforo (dot) no se ordena.
+const COLS = [
+  { key: "ticker",            label: "ticker",   kind: "str", cls: "" },
+  { key: "type",              label: "tipo",     kind: "str", cls: "" },
+  { key: "strike_low",        label: "strikes",  kind: "num", cls: "" },
+  { key: "expiration",        label: "exp",      kind: "str", cls: "" },
+  { key: "max_loss",          label: "riesgo",   kind: "num", cls: "num" },
+  { key: "pnl",               label: "P&L",      kind: "num", cls: "num" },
+  { key: "pnl_pct",           label: "ROI",      kind: "num", cls: "num" },
+  { key: "profit_pct_of_max", label: "% del máx", kind: "num", cls: "" },
+];
+
 function Book({ book }) {
+  // Orden por defecto: P&L descendente (las que más ganan/pierden arriba).
+  const [sortKey, setSortKey] = useState("pnl");
+  const [sortDir, setSortDir] = useState("desc");
+
+  const onSort = (key) => {
+    if (key === sortKey) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir("desc");
+    }
+  };
+
+  const sorted = [...book.positions].sort((a, b) => {
+    const col = COLS.find((c) => c.key === sortKey) || COLS[5];
+    let va = a[sortKey], vb = b[sortKey];
+    // nulls al fondo siempre
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    let cmp;
+    if (col.kind === "num") {
+      cmp = Number(va) - Number(vb);
+    } else {
+      cmp = String(va).localeCompare(String(vb));
+    }
+    return sortDir === "asc" ? cmp : -cmp;
+  });
+
   return (
     <>
       <Pulse book={book} />
@@ -128,18 +170,23 @@ function Book({ book }) {
           <thead>
             <tr>
               <th></th>
-              <th>ticker</th>
-              <th>tipo</th>
-              <th>strikes</th>
-              <th>exp</th>
-              <th className="num">riesgo</th>
-              <th className="num">P&L</th>
-              <th className="num">%</th>
-              <th>% del máx</th>
+              {COLS.map((c) => (
+                <th
+                  key={c.key}
+                  className={`sortable ${c.cls}`}
+                  onClick={() => onSort(c.key)}
+                  style={{ cursor: "pointer", userSelect: "none" }}
+                >
+                  {c.label}
+                  {sortKey === c.key && (
+                    <span className="sort-arrow"> {sortDir === "asc" ? "▲" : "▼"}</span>
+                  )}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
-            {book.positions.map((p) => <PositionRow key={p.id} p={p} />)}
+            {sorted.map((p) => <PositionRow key={p.id} p={p} />)}
           </tbody>
         </table>
       </div>
@@ -604,6 +651,9 @@ thead th {
   border-bottom: 1px solid var(--line); background: var(--panel-2);
 }
 thead th.num { text-align: right; }
+thead th.sortable { cursor: pointer; transition: color 0.15s; }
+thead th.sortable:hover { color: var(--text); }
+.sort-arrow { font-size: 0.65rem; opacity: 0.8; }
 tbody td { padding: 0.62rem 0.8rem; border-bottom: 1px solid var(--line); }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr { transition: background 0.15s; }
