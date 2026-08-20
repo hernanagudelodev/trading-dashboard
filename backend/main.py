@@ -145,8 +145,11 @@ def _serializar_libro(table, capital):
             "last_synced_at": r["last_synced_at"].isoformat() if r["last_synced_at"] else None,
         })
 
-    # Exposicion agregada (mismo criterio que check_open: max_loss vs tope 40%)
-    TOPE_PCT = 40.0
+    # Exposicion agregada (mismo criterio que el sistema de trading: max_loss vs
+    # tope de cartera). El tope se lee de MAX_PORTFOLIO_RISK_PCT — la MISMA env var
+    # que usa el worker para frenar aperturas por riesgo. Asi el dashboard refleja
+    # el tope REAL configurado (no un valor hardcodeado que se desincroniza).
+    TOPE_PCT = float(os.getenv("MAX_PORTFOLIO_RISK_PCT", "40"))
     max_risk = capital * TOPE_PCT / 100.0 if capital else 0
     exposure = {
         "open_count": len(positions),
@@ -154,6 +157,7 @@ def _serializar_libro(table, capital):
         "total_max_loss": round(total_max_loss, 2),
         "pct_of_capital": round(total_max_loss / capital * 100, 1) if capital else None,
         "risk_cap": round(max_risk, 2),
+        "risk_pct": TOPE_PCT,
         "pct_of_cap_used": round(total_max_loss / max_risk * 100, 1) if max_risk else None,
         "margin_to_open": round(max_risk - total_max_loss, 2) if max_risk else None,
     }
@@ -311,6 +315,104 @@ def get_runs(limit: int = 30, _auth: bool = Depends(require_auth)):
             "mode": r["mode"],
         })
     return {"runs": runs}
+
+
+@app.get("/api/positions/{book}/{pos_id}/detail")
+def get_position_detail(book: str, pos_id: int, _auth: bool = Depends(require_auth)):
+    """
+    Detalle de UNA posicion para el modal: datos de la posicion, el rationale +
+    contexto del LLM (trade_context), y la serie de precio del subyacente
+    (yfinance, desde opened_at - 5 dias hasta hoy) con los strikes de referencia.
+
+    book: 'live' (positions) o 'paper' (paper_positions).
+    """
+    table = "positions" if book == "live" else "paper_positions"
+    ctx_fk = "position_id" if book == "live" else "paper_position_id"
+
+    # 1. La posicion. OJO con los nombres reales de columna (ver _serializar_libro):
+    #    pnl real = gross_pnl; alert_level real = last_alert_level; max_loss se
+    #    CALCULA (no es columna); current_value no se usa aca.
+    rows = query(f"""
+        SELECT id, ticker, strike_low, strike_high, expiration,
+               premium_paid, total_cost, contracts, opened_at, price_at_open,
+               status, last_alert_level, gross_pnl, pnl_pct,
+               profit_pct_of_max, sector
+        FROM {table}
+        WHERE id = %s
+    """, (pos_id,))
+    if not rows:
+        raise HTTPException(404, "Posicion no encontrada.")
+    p = rows[0]
+
+    # max_loss: mismo criterio que _serializar_libro (signo del premium decide tipo)
+    prem = float(p["premium_paid"] or 0)
+    sl   = float(p["strike_low"] or 0)
+    sh   = float(p["strike_high"] or 0)
+    ctr  = int(p["contracts"] or 1)
+    is_bps = prem < 0
+    ancho = (sh - sl) * 100 * ctr
+    max_loss = (ancho - abs(float(p["total_cost"] or 0))) if is_bps else float(p["total_cost"] or 0)
+
+    posicion = {
+        "id": p["id"], "ticker": p["ticker"],
+        "type": "BPS" if is_bps else "BCS",
+        "strike_low": sl, "strike_high": sh,
+        "expiration": p["expiration"].isoformat() if p["expiration"] else None,
+        "opened_at": p["opened_at"].isoformat() if p["opened_at"] else None,
+        "price_at_open": float(p["price_at_open"]) if p["price_at_open"] is not None else None,
+        "total_cost": float(p["total_cost"]) if p["total_cost"] is not None else None,
+        "max_loss": round(max_loss, 2),
+        "pnl": float(p["gross_pnl"]) if p["gross_pnl"] is not None else None,
+        "pnl_pct": float(p["pnl_pct"]) if p["pnl_pct"] is not None else None,
+        "profit_pct_of_max": float(p["profit_pct_of_max"]) if p["profit_pct_of_max"] is not None else None,
+        "alert_level": p["last_alert_level"], "sector": p["sector"],
+        "status": p["status"], "contracts": ctr,
+    }
+
+    # 2. El contexto del LLM (rationale + campos ricos), si existe
+    ctx_rows = query(f"""
+        SELECT claude_rationale, price_at_signal, rsi, iv, iv_percentile,
+               vix, spy_trend_25d, macro_verdict, trend_25d_pct, beta,
+               strategy_selected, strategy_reason
+        FROM trade_context
+        WHERE {ctx_fk} = %s
+        ORDER BY id DESC LIMIT 1
+    """, (pos_id,))
+    contexto = None
+    if ctx_rows:
+        c = ctx_rows[0]
+        contexto = {
+            "rationale": c["claude_rationale"],
+            "rsi": c["rsi"], "iv": c["iv"], "iv_percentile": c["iv_percentile"],
+            "vix": c["vix"], "spy_trend_25d": c["spy_trend_25d"],
+            "macro_verdict": c["macro_verdict"], "trend_25d_pct": c["trend_25d_pct"],
+            "beta": c["beta"], "strategy_reason": c["strategy_reason"],
+        }
+
+    # 3. Serie de precio del subyacente (yfinance), desde opened_at - 5 dias.
+    #    El backend del dashboard trae su propia data (independiente del worker).
+    #    Si yfinance falla, el modal igual muestra 1 y 2 — el grafico es opcional.
+    serie = None
+    serie_error = None
+    try:
+        import yfinance as yf
+        from datetime import timedelta, date
+        start = (p["opened_at"].date() - timedelta(days=5)) if p["opened_at"] else (date.today() - timedelta(days=45))
+        hist = yf.Ticker(p["ticker"]).history(start=start.isoformat(), interval="1d")
+        if hist is not None and not hist.empty:
+            serie = [
+                {"date": idx.date().isoformat(), "close": round(float(row["Close"]), 2)}
+                for idx, row in hist.iterrows()
+            ]
+    except Exception as e:
+        serie_error = f"no se pudo cargar el historico ({type(e).__name__})"
+
+    return {
+        "posicion": posicion,
+        "contexto": contexto,
+        "serie": serie,
+        "serie_error": serie_error,
+    }
 
 
 @app.get("/api/health")

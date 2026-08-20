@@ -65,7 +65,7 @@ function Pulse({ book }) {
         <div className="pulse-sub">{fmt(e.pct_of_capital, 1)}% del capital</div>
       </div>
       <div className="pulse-card pulse-card--wide">
-        <div className="pulse-label">Tope de riesgo (40%)</div>
+        <div className="pulse-label">Tope de riesgo ({e.risk_pct != null ? fmt(e.risk_pct, 0) : "—"}%)</div>
         <div className="pulse-value" style={{ fontSize: "1.4rem" }}>
           {money(e.total_max_loss)} <span className="pulse-of">/ {money(e.risk_cap)}</span>
         </div>
@@ -86,12 +86,12 @@ function Pulse({ book }) {
   );
 }
 
-function PositionRow({ p }) {
+function PositionRow({ p, onClick }) {
   const lv = levelOf(p);
   const pnlPos = (p.pnl ?? 0) >= 0;
   const pctMax = p.profit_pct_of_max != null ? p.profit_pct_of_max * 100 : null;
   return (
-    <tr style={{ background: lv.glow }}>
+    <tr style={{ background: lv.glow, cursor: onClick ? "pointer" : "default" }} onClick={onClick}>
       <td>
         <span className="dot" style={{ background: lv.dot }} />
       </td>
@@ -132,7 +132,7 @@ const COLS = [
   { key: "profit_pct_of_max", label: "% del máx", kind: "num", cls: "" },
 ];
 
-function Book({ book }) {
+function Book({ book, onRowClick }) {
   // Orden por defecto: P&L descendente (las que más ganan/pierden arriba).
   const [sortKey, setSortKey] = useState("pnl");
   const [sortDir, setSortDir] = useState("desc");
@@ -186,7 +186,7 @@ function Book({ book }) {
             </tr>
           </thead>
           <tbody>
-            {sorted.map((p) => <PositionRow key={p.id} p={p} />)}
+            {sorted.map((p) => <PositionRow key={p.id} p={p} onClick={() => onRowClick && onRowClick(p.id)} />)}
           </tbody>
         </table>
       </div>
@@ -487,12 +487,159 @@ function Login({ onOk }) {
   );
 }
 
+// ── Modal de detalle de una posicion ─────────────────────────────────────────
+// Carga /api/positions/{book}/{id}/detail: datos, contexto (rationale del LLM) y
+// la serie de precio del subyacente (yfinance). Dibuja el precio con SVG y las
+// lineas de referencia (strikes + precio de apertura).
+function SubyacenteChart({ serie, strikeLow, strikeHigh, priceOpen }) {
+  if (!serie || serie.length < 2) return null;
+  const W = 560, H = 240, PADL = 52, PADR = 60, PADT = 20, PADB = 30;
+  const closes = serie.map((p) => p.close);
+  // El rango incluye los strikes para que las lineas de referencia entren.
+  const vals = [...closes, strikeLow, strikeHigh, priceOpen].filter((v) => v != null);
+  const minY = Math.min(...vals), maxY = Math.max(...vals);
+  const rangeY = maxY - minY || 1;
+  const px = (i) => PADL + (i / (serie.length - 1 || 1)) * (W - PADL - PADR);
+  const py = (v) => PADT + (1 - (v - minY) / rangeY) * (H - PADT - PADB);
+  const line = serie.map((p, i) => `${i === 0 ? "M" : "L"} ${px(i).toFixed(1)} ${py(p.close).toFixed(1)}`).join(" ");
+  const last = closes[closes.length - 1];
+  const first = closes[0];
+  const up = last >= first;
+  const lineColor = up ? "#3fb950" : "#f85149";
+
+  // Escala Y: ~5 ticks de precio uniformemente espaciados en el rango.
+  const N_TICKS = 5;
+  const ticks = [];
+  for (let i = 0; i < N_TICKS; i++) {
+    const v = minY + (rangeY * i) / (N_TICKS - 1);
+    ticks.push(v);
+  }
+
+  const refLine = (v, color, label, anchorRight) => v == null ? null : (
+    <g>
+      <line x1={PADL} y1={py(v)} x2={W - PADR} y2={py(v)} stroke={color}
+            strokeWidth="1" strokeDasharray="3 3" opacity="0.55" />
+      <text x={W - PADR + 4} y={py(v) + 3} fill={color} fontSize="9" opacity="0.9">{label}</text>
+    </g>
+  );
+
+  const fmtD = (iso) => iso.slice(5);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: "block" }}>
+      {/* escala Y: gridlines suaves + valores de precio a la izquierda */}
+      {ticks.map((v, i) => (
+        <g key={i}>
+          <line x1={PADL} y1={py(v)} x2={W - PADR} y2={py(v)}
+                stroke="#30363d" strokeWidth="0.5" opacity="0.5" />
+          <text x={PADL - 8} y={py(v) + 3} fill="#6e7681" fontSize="9" textAnchor="end">
+            ${v.toFixed(0)}
+          </text>
+        </g>
+      ))}
+      {/* lineas de referencia: strikes y precio de apertura */}
+      {refLine(strikeHigh, "#8b949e", `$${strikeHigh} short`)}
+      {refLine(strikeLow, "#8b949e", `$${strikeLow} long`)}
+      {refLine(priceOpen, "#58a6ff", `open`)}
+      {/* linea de precio */}
+      <path d={line} fill="none" stroke={lineColor} strokeWidth="1.8" />
+      {/* punto final */}
+      <circle cx={px(serie.length - 1)} cy={py(last)} r="3" fill={lineColor} />
+      {/* etiquetas de fecha (primera y ultima) */}
+      <text x={PADL} y={H - 8} fill="#6e7681" fontSize="9">{fmtD(serie[0].date)}</text>
+      <text x={W - PADR} y={H - 8} fill="#6e7681" fontSize="9" textAnchor="end">{fmtD(serie[serie.length - 1].date)}</text>
+    </svg>
+  );
+}
+
+function PositionModal({ book, posId, onClose }) {
+  const [detail, setDetail] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    setDetail(null); setError(null);
+    authFetch(`/api/positions/${book}/${posId}/detail`)
+      .then((d) => setDetail(d))
+      .catch((e) => setError(e.message));
+  }, [book, posId]);
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={onClose}>✕</button>
+        {error && <div className="state">No se pudo cargar el detalle ({error}).</div>}
+        {!error && !detail && <div className="state">Cargando detalle…</div>}
+        {detail && (() => {
+          const p = detail.posicion;
+          const c = detail.contexto;
+          const pnlPos = (p.pnl ?? 0) >= 0;
+          return (
+            <>
+              <div className="modal-head">
+                <div>
+                  <span className="modal-ticker mono">{p.ticker}</span>
+                  <span className="modal-type mono dim"> {p.type} {p.strike_low}/{p.strike_high}</span>
+                </div>
+                <div className="modal-pnl mono" style={{ color: pnlPos ? "#3fb950" : "#f85149" }}>
+                  {signed(p.pnl)} {p.pnl_pct != null && <span className="dim">({fmt(p.pnl_pct, 1)}%)</span>}
+                </div>
+              </div>
+
+              {/* Grafico del subyacente */}
+              <div className="modal-section">
+                <div className="modal-section-title">precio del subyacente</div>
+                {detail.serie
+                  ? <SubyacenteChart serie={detail.serie} strikeLow={p.strike_low}
+                      strikeHigh={p.strike_high} priceOpen={p.price_at_open} />
+                  : <div className="dim" style={{ fontSize: "0.8rem", padding: "1rem 0" }}>
+                      {detail.serie_error || "sin datos de precio"}
+                    </div>}
+              </div>
+
+              {/* Datos de la posicion */}
+              <div className="modal-section">
+                <div className="modal-grid">
+                  <div><span className="dim">costo</span><br/>{money(p.total_cost)}</div>
+                  <div><span className="dim">riesgo máx</span><br/>{money(p.max_loss)}</div>
+                  <div><span className="dim">apertura</span><br/>{p.opened_at?.slice(0, 10)}</div>
+                  <div><span className="dim">expira</span><br/>{p.expiration}</div>
+                  <div><span className="dim">precio apertura</span><br/>{p.price_at_open != null ? "$" + fmt(p.price_at_open, 2) : "—"}</div>
+                  <div><span className="dim">% del máx</span><br/>{p.profit_pct_of_max != null ? fmt(p.profit_pct_of_max * 100, 1) + "%" : "—"}</div>
+                </div>
+              </div>
+
+              {/* Rationale del LLM */}
+              <div className="modal-section">
+                <div className="modal-section-title">por qué se abrió (rationale)</div>
+                {c && c.rationale
+                  ? <>
+                      <p className="modal-rationale">{c.rationale}</p>
+                      <div className="modal-ctx mono dim">
+                        {c.rsi != null && <span>RSI {fmt(c.rsi, 1)}</span>}
+                        {c.iv != null && <span> · IV {fmt(c.iv, 1)}</span>}
+                        {c.vix != null && <span> · VIX {fmt(c.vix, 1)}</span>}
+                        {c.beta != null && <span> · β {fmt(c.beta, 2)}</span>}
+                        {c.macro_verdict && <span> · macro: {c.macro_verdict}</span>}
+                      </div>
+                    </>
+                  : <div className="dim" style={{ fontSize: "0.8rem" }}>
+                      Sin rationale guardado (posición abierta antes del registro de contexto).
+                    </div>}
+              </div>
+            </>
+          );
+        })()}
+      </div>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const [authed, setAuthed] = useState(!!getToken());
   const [view, setView] = useState("positions");
   const [tab, setTab] = useState("live");
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
+  const [modalPos, setModalPos] = useState(null);   // {book, id} de la posicion abierta en el modal
 
   const load = () => {
     authFetch(`/api/positions`)
@@ -547,9 +694,13 @@ export default function Dashboard() {
           <main className="content">
             {error && <div className="state">No se pudo conectar al backend ({error}).<br/>¿Está corriendo uvicorn en :8000?</div>}
             {!error && !data && <div className="state">Cargando cartera…</div>}
-            {!error && data && <Book book={book} />}
+            {!error && data && <Book book={book} onRowClick={(id) => setModalPos({ book: tab, id })} />}
           </main>
         </>
+      )}
+
+      {modalPos && (
+        <PositionModal book={modalPos.book} posId={modalPos.id} onClose={() => setModalPos(null)} />
       )}
 
       {view === "equity" && (
@@ -660,8 +811,7 @@ tbody tr { transition: background 0.15s; }
 tbody tr:hover { background: var(--panel-2) !important; }
 .ticker { font-weight: 700; letter-spacing: 0.01em; }
 
-.maxbar-track { width: 90px; height: 5px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
-.maxbar-fill { height: 100%; border-radius: 3px; }
+.maxbar-track { width: 90px; height: 5px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }.maxbar-fill { height: 100%; border-radius: 3px; }
 
 .foot {
   display: flex; justify-content: space-between; align-items: center;
@@ -718,4 +868,42 @@ tbody tr:hover { background: var(--panel-2) !important; }
   thead th:nth-child(5), tbody td:nth-child(5) { display: none; }
   .foot { flex-direction: column; gap: 0.7rem; align-items: flex-start; }
 }
+
+/* ── Modal de detalle ── */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+  padding: 1.5rem;
+}
+.modal-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  width: 100%; max-width: 640px; max-height: 88vh; overflow-y: auto;
+  padding: 1.6rem 1.8rem; position: relative;
+}
+.modal-close {
+  position: absolute; top: 1rem; right: 1rem; background: none; border: none;
+  color: var(--dim); font-size: 1.1rem; cursor: pointer; line-height: 1;
+}
+.modal-close:hover { color: var(--text); }
+.modal-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding-bottom: 1rem; border-bottom: 1px solid var(--line); margin-bottom: 1.1rem;
+}
+.modal-ticker { font-size: 1.4rem; font-weight: 700; }
+.modal-type { font-size: 0.95rem; }
+.modal-pnl { font-size: 1.15rem; font-weight: 600; }
+.modal-section { margin-bottom: 1.3rem; }
+.modal-section-title {
+  font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--dim); margin-bottom: 0.6rem;
+}
+.modal-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.9rem;
+  font-size: 0.9rem; font-family: var(--mono, monospace);
+}
+.modal-grid .dim { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.modal-rationale {
+  font-size: 0.9rem; line-height: 1.55; color: var(--text); margin: 0 0 0.7rem;
+}
+.modal-ctx { font-size: 0.78rem; }
 `;
