@@ -1032,8 +1032,8 @@ tbody tr:hover { background: var(--panel-2) !important; }
 .ticker { font-weight: 700; letter-spacing: 0.01em; }
 
 /* ── Vista de posiciones: tabla (desktop) vs cards (móvil) ── */
-.mobile-only { display: none; }
-.desktop-only { display: block; }
+.mobile-only { display: none !important; }
+.desktop-only { display: block !important; }
 .sort-mobile { display: none; }
 .pcard-list { display: flex; flex-direction: column; gap: 0.6rem; }
 .pcard {
@@ -1141,8 +1141,8 @@ tbody tr:hover { background: var(--panel-2) !important; }
   .foot { flex-direction: column; gap: 0.7rem; align-items: flex-start; }
 
   /* Posiciones: cards en vez de tabla */
-  .desktop-only { display: none; }
-  .mobile-only { display: block; }
+  .desktop-only { display: none !important; }
+  .mobile-only { display: block !important; }
   .sort-mobile {
     display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;
     margin-bottom: 0.7rem; font-size: 0.78rem;
