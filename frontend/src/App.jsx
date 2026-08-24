@@ -86,6 +86,36 @@ function Pulse({ book }) {
   );
 }
 
+function PositionCard({ p, onClick }) {
+  const lv = levelOf(p);
+  const pnlPos = (p.pnl ?? 0) >= 0;
+  const pctMax = p.profit_pct_of_max != null ? p.profit_pct_of_max * 100 : null;
+  return (
+    <div className="pcard" style={{ borderLeftColor: lv.dot }} onClick={onClick}>
+      <div className="pcard-head">
+        <div className="pcard-tk">
+          <span className="dot" style={{ background: lv.dot }} />
+          <span className="mono ticker">{p.ticker}</span>
+          <span className="mono dim pcard-type">{p.type} {p.strike_low}/{p.strike_high}</span>
+        </div>
+        <div className="mono pcard-pnl" style={{ color: pnlPos ? "#3fb950" : "#f85149" }}>
+          {signed(p.pnl)}
+          {p.pnl_pct != null && <span className="dim pcard-roi"> {fmt(p.pnl_pct, 1)}%</span>}
+        </div>
+      </div>
+      <div className="pcard-grid mono">
+        <div><span className="dim">riesgo</span> {money(p.max_loss)}</div>
+        <div><span className="dim">exp</span> {p.expiration?.slice(5)}</div>
+        <div><span className="dim">% máx</span> {pctMax != null ? fmt(pctMax, 0) + "%" : "—"}</div>
+      </div>
+      <div className="maxbar-track pcard-bar">
+        <div className="maxbar-fill" style={{
+          width: `${Math.max(0, Math.min(pctMax ?? 0, 100))}%`, background: lv.dot }} />
+      </div>
+    </div>
+  );
+}
+
 function PositionRow({ p, onClick }) {
   const lv = levelOf(p);
   const pnlPos = (p.pnl ?? 0) >= 0;
@@ -165,7 +195,21 @@ function Book({ book, onRowClick }) {
   return (
     <>
       <Pulse book={book} />
-      <div className="table-wrap">
+
+      {/* Selector de orden — visible solo en móvil (los cards no tienen thead) */}
+      <div className="sort-mobile">
+        <span className="dim">ordenar:</span>
+        {COLS.filter((c) => ["max_loss", "pnl", "pnl_pct", "profit_pct_of_max"].includes(c.key)).map((c) => (
+          <button key={c.key}
+            className={sortKey === c.key ? "sortchip active" : "sortchip"}
+            onClick={() => onSort(c.key)}>
+            {c.label}{sortKey === c.key && (sortDir === "asc" ? " ▲" : " ▼")}
+          </button>
+        ))}
+      </div>
+
+      {/* Vista DESKTOP: tabla */}
+      <div className="table-wrap desktop-only">
         <table>
           <thead>
             <tr>
@@ -190,6 +234,11 @@ function Book({ book, onRowClick }) {
           </tbody>
         </table>
       </div>
+
+      {/* Vista MÓVIL: cards apilados */}
+      <div className="pcard-list mobile-only">
+        {sorted.map((p) => <PositionCard key={p.id} p={p} onClick={() => onRowClick && onRowClick(p.id)} />)}
+      </div>
     </>
   );
 }
@@ -197,80 +246,212 @@ function Book({ book, onRowClick }) {
 function EquityCurve() {
   const [eq, setEq] = useState(null);
   const [error, setError] = useState(null);
+  const [mode, setMode] = useState("days");   // "days" | "range"
   const [days, setDays] = useState(90);
+  const [fromD, setFromD] = useState("");
+  const [toD, setToD] = useState("");
+  const [hover, setHover] = useState(null);    // índice del punto bajo el cursor
+  const [showSpy, setShowSpy] = useState(false);
+  const [spy, setSpy] = useState(null);
+
+  const rangeQS = () => {
+    if (mode === "range" && (fromD || toD)) {
+      const qs = new URLSearchParams();
+      if (fromD) qs.set("from_date", fromD);
+      if (toD) qs.set("to_date", toD);
+      return qs.toString();
+    }
+    return `days=${days}`;
+  };
 
   useEffect(() => {
-    authFetch(`/api/equity?days=${days}`)
+    authFetch(`/api/equity?${rangeQS()}`)
       .then((d) => { setEq(d); setError(null); })
       .catch((e) => setError(e.message));
-  }, [days]);
+  }, [mode, days, fromD, toD]);
+
+  // SPY se trae aparte y solo cuando se activa el toggle (evita llamar yfinance
+  // si no se usa). CLAVE: SPY usa el rango de fechas REAL del NLV (start_at/end_at
+  // del summary), no 'days' — sino "siempre" (days=99999) traeria 27 años de SPY
+  // contra 3 meses de NLV. Asi SPY siempre matchea el periodo real de la cartera.
+  useEffect(() => {
+    if (!showSpy) return;
+    if (!eq || !eq.summary) return;
+    setSpy(null);
+    const from = eq.summary.start_at.slice(0, 10);
+    const to   = eq.summary.end_at.slice(0, 10);
+    authFetch(`/api/spy?from_date=${from}&to_date=${to}`)
+      .then((d) => setSpy(d))
+      .catch(() => setSpy({ series: [], error: "no se pudo cargar SPY" }));
+  }, [showSpy, eq]);
 
   if (error) return <div className="state">No se pudo cargar el patrimonio ({error}).</div>;
   if (!eq) return <div className="state">Cargando patrimonio…</div>;
-  if (!eq.series.length) return <div className="state">Sin datos de patrimonio en el periodo.</div>;
 
-  const s = eq.summary;
-  const pos = s.change >= 0;
+  const rangeControls = (
+    <div className="eq-controls">
+      <div className="range-picker">
+        {[30, 60, 90].map((d) => (
+          <button key={d}
+            className={mode === "days" && days === d ? "chip active" : "chip"}
+            onClick={() => { setMode("days"); setDays(d); }}>{d}d</button>
+        ))}
+        <button
+          className={mode === "days" && days >= 99999 ? "chip active" : "chip"}
+          onClick={() => { setMode("days"); setDays(99999); }}>siempre</button>
+      </div>
+      <div className="date-range">
+        <input type="date" value={fromD} max={toD || undefined}
+          onChange={(e) => { setFromD(e.target.value); setMode("range"); }} className="date-in" />
+        <span className="dim">→</span>
+        <input type="date" value={toD} min={fromD || undefined}
+          onChange={(e) => { setToD(e.target.value); setMode("range"); }} className="date-in" />
+        {(fromD || toD) && (
+          <button className="chip" onClick={() => { setFromD(""); setToD(""); setMode("days"); setDays(90); }}>✕</button>
+        )}
+      </div>
+    </div>
+  );
 
-  // Escalar la curva a un viewBox. Padding para que no toque bordes.
-  const W = 1000, H = 320, PAD = 24;
-  const xs = eq.series.map((_, i) => i);
-  const ys = eq.series.map((p) => p.nlv);
-  const minY = Math.min(...ys), maxY = Math.max(...ys);
-  const rangeY = maxY - minY || 1;
-  const px = (i) => PAD + (i / (eq.series.length - 1 || 1)) * (W - 2 * PAD);
-  const py = (v) => PAD + (1 - (v - minY) / rangeY) * (H - 2 * PAD);
+  if (!eq.series.length) return (
+    <>
+      {rangeControls}
+      <div className="state">Sin datos de patrimonio en el periodo.</div>
+    </>
+  );
 
-  const line = eq.series.map((p, i) => `${i === 0 ? "M" : "L"} ${px(i).toFixed(1)} ${py(p.nlv).toFixed(1)}`).join(" ");
-  const area = `${line} L ${px(eq.series.length - 1).toFixed(1)} ${H - PAD} L ${px(0).toFixed(1)} ${H - PAD} Z`;
-  const stroke = pos ? "#3fb950" : "#f85149";
+  const s = eq.series;
+  const sm = eq.summary;
+  const pos = sm.change >= 0;
 
+  // SVG SIN estiramiento (aspect ratio real) para que el tooltip mapee bien.
+  const W = 1000, H = 340, PADL = 8, PADR = 8, PADT = 20, PADB = 8;
+
+  // ¿Comparamos con SPY? Si el toggle está activo y hay datos, ambas curvas se
+  // normalizan a % desde su primer punto (misma escala) y comparten eje Y.
+  const spyReady = showSpy && spy && spy.series && spy.series.length > 1;
+
+  const px = (i, n) => PADL + (i / ((n ?? s.length) - 1 || 1)) * (W - PADL - PADR);
+
+  let line, area, stroke, spyLine, spyPct, nlvPct, yMode, py;
   const fmtDate = (iso) => iso.slice(5, 10);
+  const fmtDateFull = (iso) => iso.slice(0, 10);
+
+  if (spyReady) {
+    // Modo comparación: todo en % desde el inicio.
+    yMode = "pct";
+    // Base = primer NLV distinto de cero (snapshots viejos pueden tener NLV=0,
+    // que daria division por cero -> +∞%). Los ceros iniciales se muestran como 0%.
+    const nlv0 = s.find((p) => p.nlv > 0)?.nlv || 1;
+    nlvPct = s.map((p) => (p.nlv > 0 ? (p.nlv / nlv0 - 1) * 100 : 0));
+    const spy0 = spy.series.find((p) => p.close > 0)?.close || 1;
+    spyPct = spy.series.map((p) => (p.close / spy0 - 1) * 100);
+    const allPct = [...nlvPct, ...spyPct];
+    const minP = Math.min(...allPct), maxP = Math.max(...allPct);
+    const rangeP = maxP - minP || 1;
+    py = (v) => PADT + (1 - (v - minP) / rangeP) * (H - PADT - PADB);
+    line = nlvPct.map((v, i) => `${i === 0 ? "M" : "L"} ${px(i, s.length).toFixed(1)} ${py(v).toFixed(1)}`).join(" ");
+    spyLine = spyPct.map((v, i) => `${i === 0 ? "M" : "L"} ${px(i, spyPct.length).toFixed(1)} ${py(v).toFixed(1)}`).join(" ");
+    area = null; // sin área en modo comparación (dos líneas)
+    stroke = pos ? "#3fb950" : "#f85149";
+  } else {
+    // Modo normal: NLV absoluto con área.
+    yMode = "abs";
+    const ys = s.map((p) => p.nlv);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const rangeY = maxY - minY || 1;
+    py = (v) => PADT + (1 - (v - minY) / rangeY) * (H - PADT - PADB);
+    line = s.map((p, i) => `${i === 0 ? "M" : "L"} ${px(i, s.length).toFixed(1)} ${py(p.nlv).toFixed(1)}`).join(" ");
+    area = `${line} L ${px(s.length - 1, s.length).toFixed(1)} ${H - PADB} L ${px(0, s.length).toFixed(1)} ${H - PADB} Z`;
+    stroke = pos ? "#3fb950" : "#f85149";
+  }
+
+  // Tooltip: del evento (mouse/touch) al índice más cercano.
+  const onMove = (e) => {
+    const svg = e.currentTarget;
+    const rect = svg.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const relX = (clientX - rect.left) / rect.width;    // 0..1
+    const xInView = relX * W;
+    const i = Math.round(((xInView - PADL) / (W - PADL - PADR)) * (s.length - 1));
+    setHover(Math.max(0, Math.min(i, s.length - 1)));
+  };
+
+  const hoverPt = hover != null ? s[hover] : null;
 
   return (
     <>
       <div className="pulse">
         <div className="pulse-card">
           <div className="pulse-label">Cambio del periodo</div>
-          <div className="pulse-value" style={{ color: pos ? "#3fb950" : "#f85149" }}>
-            {signed(s.change)}
-          </div>
-          <div className="pulse-sub">{s.change_pct >= 0 ? "+" : ""}{fmt(s.change_pct, 1)}% en {s.points} puntos</div>
+          <div className="pulse-value" style={{ color: pos ? "#3fb950" : "#f85149" }}>{signed(sm.change)}</div>
+          <div className="pulse-sub">{sm.change_pct >= 0 ? "+" : ""}{fmt(sm.change_pct, 1)}% en {sm.points} puntos</div>
         </div>
         <div className="pulse-card">
           <div className="pulse-label">NLV actual</div>
-          <div className="pulse-value">{money(s.end_nlv, 0)}</div>
-          <div className="pulse-sub">desde {money(s.start_nlv, 0)}</div>
+          <div className="pulse-value">{money(sm.end_nlv, 0)}</div>
+          <div className="pulse-sub">desde {money(sm.start_nlv, 0)}</div>
         </div>
-        <div className="pulse-card pulse-card--wide">
-          <div className="pulse-label">Rango del periodo</div>
-          <div className="pulse-value" style={{ fontSize: "1.4rem" }}>
-            {money(s.min_nlv, 0)} <span className="pulse-of">—</span> {money(s.max_nlv, 0)}
+        <div className="pulse-card">
+          <div className="pulse-label">Drawdown máx</div>
+          <div className="pulse-value" style={{ color: sm.max_drawdown < 0 ? "#f85149" : "var(--text)" }}>
+            {sm.max_drawdown < 0 ? money(sm.max_drawdown, 0) : "$0"}
           </div>
-          <div className="range-picker">
-            {[30, 60, 90].map((d) => (
-              <button key={d} className={days === d ? "chip active" : "chip"} onClick={() => setDays(d)}>
-                {d}d
-              </button>
-            ))}
-          </div>
+          <div className="pulse-sub">{sm.max_drawdown_pct < 0 ? fmt(sm.max_drawdown_pct, 1) + "%" : "sin caídas"}</div>
         </div>
       </div>
 
+      {rangeControls}
+
       <div className="chart-wrap">
-        <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="chart">
+        <div className="chart-legend">
+          <button className={showSpy ? "spy-toggle active" : "spy-toggle"}
+            onClick={() => setShowSpy((v) => !v)}>
+            <span className="legend-swatch" style={{ background: stroke }} /> tu cartera
+            {showSpy && <><span className="legend-swatch spy" /> SPY</>}
+            <span className="spy-hint">{showSpy ? "comparando %" : "vs SPY"}</span>
+          </button>
+          {spyReady && (
+            <span className="spy-verdict mono">
+              tú {nlvPct[nlvPct.length-1] >= 0 ? "+" : ""}{fmt(nlvPct[nlvPct.length-1],1)}% · SPY {spyPct[spyPct.length-1] >= 0 ? "+" : ""}{fmt(spyPct[spyPct.length-1],1)}%
+            </span>
+          )}
+          {showSpy && spy && spy.error && <span className="dim" style={{fontSize:"0.75rem"}}>{spy.error}</span>}
+        </div>
+        <svg viewBox={`0 0 ${W} ${H}`} className="chart"
+             onMouseMove={onMove} onMouseLeave={() => setHover(null)}
+             onTouchStart={onMove} onTouchMove={onMove} onTouchEnd={() => setHover(null)}>
           <defs>
             <linearGradient id="area-grad" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor={stroke} stopOpacity="0.22" />
               <stop offset="100%" stopColor={stroke} stopOpacity="0" />
             </linearGradient>
           </defs>
-          <path d={area} fill="url(#area-grad)" />
+          {area && <path d={area} fill="url(#area-grad)" />}
+          {spyReady && <path d={spyLine} fill="none" stroke="#8b949e" strokeWidth="1.6"
+                             strokeDasharray="5 4" vectorEffect="non-scaling-stroke" />}
           <path d={line} fill="none" stroke={stroke} strokeWidth="2" vectorEffect="non-scaling-stroke" />
+          {hoverPt && (
+            <g>
+              <line x1={px(hover, s.length)} y1={PADT} x2={px(hover, s.length)} y2={H - PADB}
+                    stroke="var(--dim)" strokeWidth="1" strokeDasharray="3 3" vectorEffect="non-scaling-stroke" />
+              <circle cx={px(hover, s.length)} cy={py(yMode === "pct" ? nlvPct[hover] : hoverPt.nlv)} r="4" fill={stroke} />
+            </g>
+          )}
         </svg>
+        {hoverPt && (
+          <div className="chart-tip" style={{
+            left: `${(px(hover, s.length) / W) * 100}%`,
+            transform: px(hover, s.length) > W / 2 ? "translateX(-105%)" : "translateX(5%)",
+          }}>
+            <div className="chart-tip-val mono">{money(hoverPt.nlv, 2)}</div>
+            {yMode === "pct" && <div className="chart-tip-date" style={{color: stroke}}>{nlvPct[hover] >= 0 ? "+" : ""}{fmt(nlvPct[hover],1)}%</div>}
+            <div className="chart-tip-date dim">{fmtDateFull(hoverPt.t)}</div>
+          </div>
+        )}
         <div className="chart-axis">
-          <span>{fmtDate(s.start_at)}</span>
-          <span>{fmtDate(s.end_at)}</span>
+          <span>{fmtDate(sm.start_at)}</span>
+          <span>{fmtDate(sm.end_at)}</span>
         </div>
       </div>
     </>
@@ -341,7 +522,7 @@ function ClosedTrades() {
         </div>
       </div>
 
-      <div className="table-wrap">
+      <div className="table-wrap desktop-only">
         <table>
           <thead>
             <tr>
@@ -371,6 +552,31 @@ function ClosedTrades() {
             })}
           </tbody>
         </table>
+      </div>
+
+      {/* Vista MÓVIL: cards apilados */}
+      <div className="pcard-list mobile-only">
+        {book.trades.map((t, i) => {
+          const pos = t.pnl >= 0;
+          return (
+            <div className="pcard" key={i} style={{ borderLeftColor: pos ? "#3fb950" : "#f85149" }}>
+              <div className="pcard-head">
+                <div className="pcard-tk">
+                  <span className="mono ticker">{t.ticker}</span>
+                  <span className="mono dim pcard-type">{t.strategy}</span>
+                </div>
+                <div className="mono pcard-pnl" style={{ color: pos ? "#3fb950" : "#f85149" }}>
+                  {signed(t.pnl)}
+                  {t.pnl_pct != null && <span className="dim pcard-roi"> {fmt(t.pnl_pct, 1)}%</span>}
+                </div>
+              </div>
+              <div className="pcard-grid mono" style={{ gridTemplateColumns: "1fr 1fr" }}>
+                <div><span className="dim">motivo</span> {t.close_reason || "—"}</div>
+                <div><span className="dim">fecha</span> {t.closed_at ? t.closed_at.slice(0, 10) : "—"}</div>
+              </div>
+            </div>
+          );
+        })}
       </div>
       </>
       )}
@@ -636,6 +842,7 @@ function PositionModal({ book, posId, onClose }) {
 export default function Dashboard() {
   const [authed, setAuthed] = useState(!!getToken());
   const [view, setView] = useState("positions");
+  const [menuOpen, setMenuOpen] = useState(false);
   const [tab, setTab] = useState("live");
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
@@ -663,14 +870,23 @@ export default function Dashboard() {
       <style>{CSS}</style>
       <header className="topbar">
         <div className="brand">
+          <button className="hamburger" onClick={() => setMenuOpen((v) => !v)} aria-label="menú">
+            {menuOpen ? "✕" : "☰"}
+          </button>
           <span className="brand-mark" />
           <span className="brand-name">bull<span className="brand-accent">desk</span></span>
         </div>
-        <nav className="nav">
-          <button className={view === "positions" ? "navbtn active" : "navbtn"} onClick={() => setView("positions")}>posiciones</button>
-          <button className={view === "equity" ? "navbtn active" : "navbtn"} onClick={() => setView("equity")}>patrimonio</button>
-          <button className={view === "closed" ? "navbtn active" : "navbtn"} onClick={() => setView("closed")}>cerrados</button>
-          <button className={view === "runs" ? "navbtn active" : "navbtn"} onClick={() => setView("runs")}>runs</button>
+        <nav className={menuOpen ? "nav open" : "nav"}>
+          {["positions", "equity", "closed", "runs"].map((v) => {
+            const labels = { positions: "posiciones", equity: "patrimonio", closed: "cerrados", runs: "runs" };
+            return (
+              <button key={v}
+                className={view === v ? "navbtn active" : "navbtn"}
+                onClick={() => { setView(v); setMenuOpen(false); }}>
+                {labels[v]}
+              </button>
+            );
+          })}
         </nav>
         <div className="capital">
           <span className="capital-label">capital</span>
@@ -761,6 +977,10 @@ const CSS = `
   backdrop-filter: blur(8px); z-index: 10;
 }
 .brand { display: flex; align-items: center; gap: 0.6rem; }
+.hamburger {
+  display: none; background: transparent; border: none; color: var(--text);
+  font-size: 1.3rem; cursor: pointer; padding: 0 0.2rem; line-height: 1;
+}
 .brand-mark {
   width: 22px; height: 22px; border-radius: 5px;
   background: linear-gradient(135deg, #3fb950, #2ea043);
@@ -811,6 +1031,35 @@ tbody tr { transition: background 0.15s; }
 tbody tr:hover { background: var(--panel-2) !important; }
 .ticker { font-weight: 700; letter-spacing: 0.01em; }
 
+/* ── Vista de posiciones: tabla (desktop) vs cards (móvil) ── */
+.mobile-only { display: none; }
+.desktop-only { display: block; }
+.sort-mobile { display: none; }
+.pcard-list { display: flex; flex-direction: column; gap: 0.6rem; }
+.pcard {
+  background: var(--panel); border: 1px solid var(--line);
+  border-left: 3px solid var(--line); border-radius: 10px;
+  padding: 0.8rem 0.9rem; cursor: pointer;
+}
+.pcard-head { display: flex; justify-content: space-between; align-items: baseline; }
+.pcard-tk { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; }
+.pcard-tk .ticker { font-size: 1.05rem; font-weight: 700; }
+.pcard-type { font-size: 0.8rem; }
+.pcard-pnl { font-size: 1.05rem; font-weight: 600; }
+.pcard-roi { font-size: 0.8rem; font-weight: 400; }
+.pcard-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.4rem;
+  margin-top: 0.6rem; font-size: 0.85rem;
+}
+.pcard-grid .dim { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; margin-right: 0.2rem; }
+.pcard-bar { margin-top: 0.7rem; width: 100%; }
+.sortchip {
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--dim);
+  font-size: 0.78rem; padding: 0.3rem 0.6rem; border-radius: 20px;
+  cursor: pointer; font-family: inherit;
+}
+.sortchip.active { color: var(--text); border-color: #3fb950; }
+
 .maxbar-track { width: 90px; height: 5px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }.maxbar-fill { height: 100%; border-radius: 3px; }
 
 .foot {
@@ -853,10 +1102,35 @@ tbody tr:hover { background: var(--panel-2) !important; }
 .navbtn { background: transparent; border: none; color: var(--dim); font-size: 0.9rem; padding: 0.4rem 0.9rem; border-radius: 7px; cursor: pointer; font-family: inherit; transition: all 0.15s; }
 .navbtn:hover { color: var(--text); }
 .navbtn.active { color: var(--text); background: var(--panel-2); }
-.chart-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.2rem; }
-.chart { width: 100%; height: 320px; display: block; }
+.chart-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.2rem; position: relative; }
+.chart { width: 100%; height: 320px; display: block; cursor: crosshair; touch-action: none; }
 .chart-axis { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 0.72rem; color: var(--dim); margin-top: 0.5rem; padding: 0 0.2rem; }
-.range-picker { display: flex; gap: 0.35rem; margin-top: 0.7rem; }
+.range-picker { display: flex; gap: 0.35rem; }
+.eq-controls { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.7rem; margin: 0.9rem 0; }
+.date-range { display: flex; align-items: center; gap: 0.4rem; }
+.date-in {
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  font-family: var(--mono); font-size: 0.78rem; padding: 0.28rem 0.5rem;
+  border-radius: 6px; color-scheme: dark;
+}
+.chart-tip {
+  position: absolute; top: 1.4rem; pointer-events: none;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 0.45rem 0.7rem; z-index: 5; white-space: nowrap;
+}
+.chart-tip-val { font-size: 0.95rem; font-weight: 600; }
+.chart-tip-date { font-size: 0.72rem; margin-top: 0.1rem; }
+.chart-legend { display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
+.spy-toggle {
+  display: flex; align-items: center; gap: 0.4rem; background: var(--panel-2);
+  border: 1px solid var(--line); color: var(--text); font-size: 0.8rem;
+  padding: 0.3rem 0.65rem; border-radius: 20px; cursor: pointer; font-family: inherit;
+}
+.spy-toggle.active { border-color: #8b949e; }
+.spy-hint { color: var(--dim); font-size: 0.72rem; margin-left: 0.2rem; }
+.legend-swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+.legend-swatch.spy { background: #8b949e; }
+.spy-verdict { font-size: 0.82rem; color: var(--dim); }
 .chip { background: var(--panel-2); border: 1px solid var(--line); color: var(--dim); font-family: var(--mono); font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 6px; cursor: pointer; transition: all 0.15s; }
 .chip:hover { color: var(--text); }
 .chip.active { background: #1f6feb22; border-color: #1f6feb; color: #58a6ff; }
@@ -864,9 +1138,33 @@ tbody tr:hover { background: var(--panel-2) !important; }
 
 @media (max-width: 720px) {
   .pulse { grid-template-columns: 1fr; }
-  thead th:nth-child(4), tbody td:nth-child(4),
-  thead th:nth-child(5), tbody td:nth-child(5) { display: none; }
   .foot { flex-direction: column; gap: 0.7rem; align-items: flex-start; }
+
+  /* Posiciones: cards en vez de tabla */
+  .desktop-only { display: none; }
+  .mobile-only { display: block; }
+  .sort-mobile {
+    display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;
+    margin-bottom: 0.7rem; font-size: 0.78rem;
+  }
+
+  /* Menú desplegable */
+  .hamburger { display: block; }
+  .topbar { padding: 0.9rem 1.1rem; }
+  .nav {
+    display: none;
+    position: absolute; top: 100%; left: 0; right: 0;
+    flex-direction: column; gap: 0;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    padding: 0.4rem 0.6rem;
+  }
+  .nav.open { display: flex; }
+  .navbtn {
+    text-align: left; padding: 0.75rem 0.8rem; font-size: 1rem;
+    border-radius: 8px;
+  }
+  .capital-label { display: none; }
+  .brand-name { font-size: 1rem; }
 }
 
 /* ── Modal de detalle ── */

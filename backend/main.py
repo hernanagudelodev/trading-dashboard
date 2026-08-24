@@ -176,19 +176,79 @@ def get_positions(_auth: bool = Depends(require_auth)):
     }
 
 
+@app.get("/api/spy")
+def get_spy(days: int = 90, from_date: str = None, to_date: str = None,
+            _auth: bool = Depends(require_auth)):
+    """
+    Serie de SPY (cierre diario) para comparar contra la curva de patrimonio.
+    Mismo rango que /api/equity. El backend trae los datos crudos; la
+    normalizacion (a % desde el inicio) la hace el frontend, para alinearla con
+    el primer punto real del NLV.
+
+    Endpoint SEPARADO a proposito: si yfinance falla, /api/equity sigue OK y la
+    curva de patrimonio se dibuja sin el benchmark (degradacion suave).
+    """
+    from datetime import datetime, timedelta, date as _date
+    # Resolver el rango de fechas
+    if from_date or to_date:
+        start = from_date or (_date.today() - timedelta(days=3650)).isoformat()
+        end   = to_date or _date.today().isoformat()
+    else:
+        start = (_date.today() - timedelta(days=int(days))).isoformat()
+        end   = _date.today().isoformat()
+
+    try:
+        import yfinance as yf
+        # end + 1 dia para incluir el ultimo dia
+        end_plus = (datetime.fromisoformat(end).date() + timedelta(days=1)).isoformat()
+        hist = yf.Ticker("SPY").history(start=start, end=end_plus, interval="1d")
+        if hist is None or hist.empty:
+            return {"series": [], "error": "sin datos de SPY en el rango"}
+        series = [
+            {"t": idx.date().isoformat(), "close": round(float(row["Close"]), 2)}
+            for idx, row in hist.iterrows()
+        ]
+        return {"series": series, "error": None}
+    except Exception as e:
+        return {"series": [], "error": f"no se pudo cargar SPY ({type(e).__name__})"}
+
+
 @app.get("/api/equity")
-def get_equity(days: int = 90, _auth: bool = Depends(require_auth)):
+def get_equity(days: int = 90, from_date: str = None, to_date: str = None,
+               _auth: bool = Depends(require_auth)):
     """
     Serie de patrimonio (NLV) para la curva + resumen del periodo.
-    days: ventana hacia atras (default 90). La curva usa todos los snapshots
-    del rango; el resumen compara el primero contra el ultimo.
+
+    Rango, en orden de prioridad:
+      - from_date / to_date (YYYY-MM-DD): rango explicito (filtro dinamico).
+        Cualquiera de los dos puede omitirse (open-ended).
+      - days: ventana hacia atras (default 90). Para "siempre", el front manda
+        un numero grande (ej. 99999) y trae todo el historico.
     """
-    rows = query("""
-        SELECT snapshot_at, net_liquidating_value AS nlv, cash_balance
-        FROM account_snapshots
-        WHERE snapshot_at >= NOW() - (%s || \' days\')::interval
-        ORDER BY snapshot_at ASC
-    """, (days,))
+    if from_date or to_date:
+        # Rango explicito. Construimos el WHERE con los bordes que haya.
+        clauses, params = [], []
+        if from_date:
+            clauses.append("snapshot_at >= %s")
+            params.append(from_date)
+        if to_date:
+            # incluir todo el dia 'to_date' -> < dia siguiente
+            clauses.append("snapshot_at < (%s::date + INTERVAL '1 day')")
+            params.append(to_date)
+        where = " AND ".join(clauses)
+        rows = query(f"""
+            SELECT snapshot_at, net_liquidating_value AS nlv, cash_balance
+            FROM account_snapshots
+            WHERE {where}
+            ORDER BY snapshot_at ASC
+        """, tuple(params))
+    else:
+        rows = query("""
+            SELECT snapshot_at, net_liquidating_value AS nlv, cash_balance
+            FROM account_snapshots
+            WHERE snapshot_at >= NOW() - (%s || \' days\')::interval
+            ORDER BY snapshot_at ASC
+        """, (days,))
 
     if not rows:
         return {"series": [], "summary": None}
@@ -203,6 +263,18 @@ def get_equity(days: int = 90, _auth: bool = Depends(require_auth)):
     change_pct = (change / first_nlv * 100) if first_nlv else 0
     nlvs = [float(r["nlv"]) for r in rows]
 
+    # Drawdown maximo: peor caida desde un pico previo (en $ y en %).
+    peak = nlvs[0]
+    max_dd = 0.0
+    max_dd_pct = 0.0
+    for v in nlvs:
+        if v > peak:
+            peak = v
+        dd = v - peak
+        if dd < max_dd:
+            max_dd = dd
+            max_dd_pct = (dd / peak * 100) if peak else 0
+
     summary = {
         "start_at": rows[0]["snapshot_at"].isoformat(),
         "end_at":   rows[-1]["snapshot_at"].isoformat(),
@@ -212,6 +284,8 @@ def get_equity(days: int = 90, _auth: bool = Depends(require_auth)):
         "change_pct": round(change_pct, 2),
         "min_nlv":   round(min(nlvs), 2),
         "max_nlv":   round(max(nlvs), 2),
+        "max_drawdown": round(max_dd, 2),
+        "max_drawdown_pct": round(max_dd_pct, 2),
         "points":    len(series),
     }
     return {"series": series, "summary": summary}
