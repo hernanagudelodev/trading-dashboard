@@ -253,6 +253,8 @@ function EquityCurve() {
   const [hover, setHover] = useState(null);    // índice del punto bajo el cursor
   const [showSpy, setShowSpy] = useState(false);
   const [spy, setSpy] = useState(null);
+  const [twr, setTwr] = useState(null);        // rendimiento ajustado por flujos
+  const [chartView, setChartView] = useState("pnl");  // "pnl" | "nlv" | "twr"
 
   const rangeQS = () => {
     if (mode === "range" && (fromD || toD)) {
@@ -268,6 +270,11 @@ function EquityCurve() {
     authFetch(`/api/equity?${rangeQS()}`)
       .then((d) => { setEq(d); setError(null); })
       .catch((e) => setError(e.message));
+    // TWR / P&L real (worker-api, via backend). Degrada suave si no está.
+    setTwr(null);
+    authFetch(`/api/twr?${rangeQS()}`)
+      .then((d) => setTwr(d))
+      .catch(() => setTwr({ available: false }));
   }, [mode, days, fromD, toD]);
 
   // SPY se trae aparte y solo cuando se activa el toggle (evita llamar yfinance
@@ -322,75 +329,97 @@ function EquityCurve() {
 
   const s = eq.series;
   const sm = eq.summary;
-  const pos = sm.change >= 0;
+
+  const twrOk = twr && twr.available && twr.pnl_series && twr.pnl_series.length > 1;
+  // Si se pidió una vista ajustada pero la worker-api no está, caemos a NLV.
+  const effView = (!twrOk && (chartView === "pnl" || chartView === "twr")) ? "nlv" : chartView;
 
   // SVG SIN estiramiento (aspect ratio real) para que el tooltip mapee bien.
   const W = 1000, H = 340, PADL = 8, PADR = 8, PADT = 20, PADB = 8;
 
-  // ¿Comparamos con SPY? Si el toggle está activo y hay datos, ambas curvas se
-  // normalizan a % desde su primer punto (misma escala) y comparten eje Y.
-  const spyReady = showSpy && spy && spy.series && spy.series.length > 1;
+  const spyReady = showSpy && spy && spy.series && spy.series.length > 1 && effView === "twr";
 
   const px = (i, n) => PADL + (i / ((n ?? s.length) - 1 || 1)) * (W - PADL - PADR);
-
-  let line, area, stroke, spyLine, spyPct, nlvPct, yMode, py;
   const fmtDate = (iso) => iso.slice(5, 10);
   const fmtDateFull = (iso) => iso.slice(0, 10);
 
-  if (spyReady) {
-    // Modo comparación: todo en % desde el inicio.
-    yMode = "pct";
-    // Base = primer NLV distinto de cero (snapshots viejos pueden tener NLV=0,
-    // que daria division por cero -> +∞%). Los ceros iniciales se muestran como 0%.
-    const nlv0 = s.find((p) => p.nlv > 0)?.nlv || 1;
-    nlvPct = s.map((p) => (p.nlv > 0 ? (p.nlv / nlv0 - 1) * 100 : 0));
-    const spy0 = spy.series.find((p) => p.close > 0)?.close || 1;
-    spyPct = spy.series.map((p) => (p.close / spy0 - 1) * 100);
-    const allPct = [...nlvPct, ...spyPct];
-    const minP = Math.min(...allPct), maxP = Math.max(...allPct);
-    const rangeP = maxP - minP || 1;
-    py = (v) => PADT + (1 - (v - minP) / rangeP) * (H - PADT - PADB);
-    line = nlvPct.map((v, i) => `${i === 0 ? "M" : "L"} ${px(i, s.length).toFixed(1)} ${py(v).toFixed(1)}`).join(" ");
-    spyLine = spyPct.map((v, i) => `${i === 0 ? "M" : "L"} ${px(i, spyPct.length).toFixed(1)} ${py(v).toFixed(1)}`).join(" ");
-    area = null; // sin área en modo comparación (dos líneas)
-    stroke = pos ? "#3fb950" : "#f85149";
+  // ── Elegir la serie a graficar según la vista ────────────────────────────────
+  // pnl: ganancia real acumulada ($, sin saltos por flujos) — la vista principal
+  // nlv: NLV crudo ($, salta con depósitos) — "cuánta plata hay"
+  // twr: rendimiento acumulado (%, inmune al capital) — puede comparar vs SPY
+  let plotVals, valFmt, isPct;
+  if (effView === "pnl") {
+    plotVals = twr.pnl_series.map((p) => p.pnl);
+    valFmt = (v) => signed(v); isPct = false;
+  } else if (effView === "twr") {
+    plotVals = twr.series.map((p) => p.cum_pct);
+    valFmt = (v) => `${v >= 0 ? "+" : ""}${fmt(v, 1)}%`; isPct = true;
   } else {
-    // Modo normal: NLV absoluto con área.
-    yMode = "abs";
-    const ys = s.map((p) => p.nlv);
-    const minY = Math.min(...ys), maxY = Math.max(...ys);
-    const rangeY = maxY - minY || 1;
-    py = (v) => PADT + (1 - (v - minY) / rangeY) * (H - PADT - PADB);
-    line = s.map((p, i) => `${i === 0 ? "M" : "L"} ${px(i, s.length).toFixed(1)} ${py(p.nlv).toFixed(1)}`).join(" ");
-    area = `${line} L ${px(s.length - 1, s.length).toFixed(1)} ${H - PADB} L ${px(0, s.length).toFixed(1)} ${H - PADB} Z`;
-    stroke = pos ? "#3fb950" : "#f85149";
+    plotVals = s.map((p) => p.nlv);
+    valFmt = (v) => money(v, 0); isPct = false;
   }
 
-  // Tooltip: del evento (mouse/touch) al índice más cercano.
+  const lastVal = plotVals[plotVals.length - 1];
+  const pos = lastVal >= 0;
+  const stroke = pos ? "#3fb950" : "#f85149";
+
+  const minY = Math.min(...plotVals), maxY = Math.max(...plotVals);
+  const rangeY = maxY - minY || 1;
+  const py = (v) => PADT + (1 - (v - minY) / rangeY) * (H - PADT - PADB);
+  const line = plotVals.map((v, i) => `${i === 0 ? "M" : "L"} ${px(i, plotVals.length).toFixed(1)} ${py(v).toFixed(1)}`).join(" ");
+  // Área solo en vistas de $ (pnl/nlv), no en % (twr con posible SPY)
+  const area = isPct ? null
+    : `${line} L ${px(plotVals.length - 1, plotVals.length).toFixed(1)} ${H - PADB} L ${px(0, plotVals.length).toFixed(1)} ${H - PADB} Z`;
+
+  // SPY (solo en vista twr): normalizado a % desde el inicio, comparte eje con twr
+  let spyLine = null, spyPct = null, twrPct = null;
+  if (spyReady) {
+    twrPct = twr.series.map((p) => p.cum_pct);
+    const spy0 = spy.series.find((p) => p.close > 0)?.close || 1;
+    spyPct = spy.series.map((p) => (p.close / spy0 - 1) * 100);
+    const allPct = [...twrPct, ...spyPct];
+    const minP = Math.min(...allPct), maxP = Math.max(...allPct);
+    const rangeP = maxP - minP || 1;
+    const pyP = (v) => PADT + (1 - (v - minP) / rangeP) * (H - PADT - PADB);
+    // Redibujar la línea principal con la escala compartida
+    spyLine = spyPct.map((v, i) => `${i === 0 ? "M" : "L"} ${px(i, spyPct.length).toFixed(1)} ${pyP(v).toFixed(1)}`).join(" ");
+  }
+
+  // Tooltip: del evento al índice más cercano (sobre la serie graficada).
   const onMove = (e) => {
     const svg = e.currentTarget;
     const rect = svg.getBoundingClientRect();
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    const relX = (clientX - rect.left) / rect.width;    // 0..1
+    const relX = (clientX - rect.left) / rect.width;
     const xInView = relX * W;
-    const i = Math.round(((xInView - PADL) / (W - PADL - PADR)) * (s.length - 1));
-    setHover(Math.max(0, Math.min(i, s.length - 1)));
+    const i = Math.round(((xInView - PADL) / (W - PADL - PADR)) * (plotVals.length - 1));
+    setHover(Math.max(0, Math.min(i, plotVals.length - 1)));
   };
 
-  const hoverPt = hover != null ? s[hover] : null;
+  const hoverPt = hover != null ? s[Math.min(hover, s.length - 1)] : null;
+  const hoverVal = hover != null ? plotVals[Math.min(hover, plotVals.length - 1)] : null;
+
+  // Métricas de arriba: si hay TWR, mostramos rendimiento ajustado y P&L real.
+  const mChange = twrOk ? twr.pnl_real : sm.change;
+  const mPct    = twrOk ? twr.twr_pct : sm.change_pct;
+  const mPos    = mChange >= 0;
 
   return (
     <>
       <div className="pulse">
         <div className="pulse-card">
-          <div className="pulse-label">Cambio del periodo</div>
-          <div className="pulse-value" style={{ color: pos ? "#3fb950" : "#f85149" }}>{signed(sm.change)}</div>
-          <div className="pulse-sub">{sm.change_pct >= 0 ? "+" : ""}{fmt(sm.change_pct, 1)}% en {sm.points} puntos</div>
+          <div className="pulse-label">{twrOk ? "Ganancia del sistema" : "Cambio del periodo"}</div>
+          <div className="pulse-value" style={{ color: mPos ? "#3fb950" : "#f85149" }}>{signed(mChange)}</div>
+          <div className="pulse-sub">
+            {twrOk ? "P&L real, sin depósitos/retiros" : `${sm.change_pct >= 0 ? "+" : ""}${fmt(sm.change_pct, 1)}% en ${sm.points} puntos`}
+          </div>
         </div>
         <div className="pulse-card">
-          <div className="pulse-label">NLV actual</div>
-          <div className="pulse-value">{money(sm.end_nlv, 0)}</div>
-          <div className="pulse-sub">desde {money(sm.start_nlv, 0)}</div>
+          <div className="pulse-label">{twrOk ? "Rendimiento (TWR)" : "NLV actual"}</div>
+          <div className="pulse-value" style={{ color: twrOk ? (mPct >= 0 ? "#3fb950" : "#f85149") : "var(--text)" }}>
+            {twrOk ? `${mPct >= 0 ? "+" : ""}${fmt(mPct, 1)}%` : money(sm.end_nlv, 0)}
+          </div>
+          <div className="pulse-sub">{twrOk ? "ajustado por flujos de capital" : `desde ${money(sm.start_nlv, 0)}`}</div>
         </div>
         <div className="pulse-card">
           <div className="pulse-label">Drawdown máx</div>
@@ -403,17 +432,39 @@ function EquityCurve() {
 
       {rangeControls}
 
+      {/* Selector de vista de la curva */}
+      <div className="view-selector">
+        <button className={effView === "pnl" ? "vchip active" : "vchip"}
+          onClick={() => { setChartView("pnl"); setShowSpy(false); }}
+          disabled={!twrOk} title={twrOk ? "" : "worker-api no disponible"}>ganancia $</button>
+        <button className={effView === "nlv" ? "vchip active" : "vchip"}
+          onClick={() => { setChartView("nlv"); setShowSpy(false); }}>capital (NLV)</button>
+        <button className={effView === "twr" ? "vchip active" : "vchip"}
+          onClick={() => setChartView("twr")}
+          disabled={!twrOk} title={twrOk ? "" : "worker-api no disponible"}>rendimiento %</button>
+        {twr && !twr.available && (
+          <span className="dim" style={{fontSize:"0.72rem"}}>· ajuste por flujos no disponible</span>
+        )}
+      </div>
+
       <div className="chart-wrap">
         <div className="chart-legend">
-          <button className={showSpy ? "spy-toggle active" : "spy-toggle"}
-            onClick={() => setShowSpy((v) => !v)}>
-            <span className="legend-swatch" style={{ background: stroke }} /> tu cartera
-            {showSpy && <><span className="legend-swatch spy" /> SPY</>}
-            <span className="spy-hint">{showSpy ? "comparando %" : "vs SPY"}</span>
-          </button>
+          <span className="view-hint dim">
+            {effView === "pnl" && "ganancia real acumulada — descuenta depósitos y retiros"}
+            {effView === "nlv" && "capital total en la cuenta — sube con depósitos"}
+            {effView === "twr" && "rendimiento acumulado (%) — inmune al capital aportado"}
+          </span>
+          {effView === "twr" && (
+            <button className={showSpy ? "spy-toggle active" : "spy-toggle"}
+              onClick={() => setShowSpy((v) => !v)}>
+              <span className="legend-swatch" style={{ background: stroke }} /> tú
+              {showSpy && <><span className="legend-swatch spy" /> SPY</>}
+              <span className="spy-hint">{showSpy ? "comparando %" : "vs SPY"}</span>
+            </button>
+          )}
           {spyReady && (
             <span className="spy-verdict mono">
-              tú {nlvPct[nlvPct.length-1] >= 0 ? "+" : ""}{fmt(nlvPct[nlvPct.length-1],1)}% · SPY {spyPct[spyPct.length-1] >= 0 ? "+" : ""}{fmt(spyPct[spyPct.length-1],1)}%
+              tú {twrPct[twrPct.length-1] >= 0 ? "+" : ""}{fmt(twrPct[twrPct.length-1],1)}% · SPY {spyPct[spyPct.length-1] >= 0 ? "+" : ""}{fmt(spyPct[spyPct.length-1],1)}%
             </span>
           )}
           {showSpy && spy && spy.error && <span className="dim" style={{fontSize:"0.75rem"}}>{spy.error}</span>}
@@ -431,22 +482,21 @@ function EquityCurve() {
           {spyReady && <path d={spyLine} fill="none" stroke="#8b949e" strokeWidth="1.6"
                              strokeDasharray="5 4" vectorEffect="non-scaling-stroke" />}
           <path d={line} fill="none" stroke={stroke} strokeWidth="2" vectorEffect="non-scaling-stroke" />
-          {hoverPt && (
+          {hover != null && hoverVal != null && (
             <g>
-              <line x1={px(hover, s.length)} y1={PADT} x2={px(hover, s.length)} y2={H - PADB}
+              <line x1={px(hover, plotVals.length)} y1={PADT} x2={px(hover, plotVals.length)} y2={H - PADB}
                     stroke="var(--dim)" strokeWidth="1" strokeDasharray="3 3" vectorEffect="non-scaling-stroke" />
-              <circle cx={px(hover, s.length)} cy={py(yMode === "pct" ? nlvPct[hover] : hoverPt.nlv)} r="4" fill={stroke} />
+              <circle cx={px(hover, plotVals.length)} cy={py(hoverVal)} r="4" fill={stroke} />
             </g>
           )}
         </svg>
-        {hoverPt && (
+        {hover != null && hoverVal != null && (
           <div className="chart-tip" style={{
-            left: `${(px(hover, s.length) / W) * 100}%`,
-            transform: px(hover, s.length) > W / 2 ? "translateX(-105%)" : "translateX(5%)",
+            left: `${(px(hover, plotVals.length) / W) * 100}%`,
+            transform: px(hover, plotVals.length) > W / 2 ? "translateX(-105%)" : "translateX(5%)",
           }}>
-            <div className="chart-tip-val mono">{money(hoverPt.nlv, 2)}</div>
-            {yMode === "pct" && <div className="chart-tip-date" style={{color: stroke}}>{nlvPct[hover] >= 0 ? "+" : ""}{fmt(nlvPct[hover],1)}%</div>}
-            <div className="chart-tip-date dim">{fmtDateFull(hoverPt.t)}</div>
+            <div className="chart-tip-val mono" style={{color: isPct ? stroke : "var(--text)"}}>{valFmt(hoverVal)}</div>
+            {hoverPt && <div className="chart-tip-date dim">{fmtDateFull(hoverPt.t)}</div>}
           </div>
         )}
         <div className="chart-axis">
@@ -1121,6 +1171,16 @@ tbody tr:hover { background: var(--panel-2) !important; }
 .chart-tip-val { font-size: 0.95rem; font-weight: 600; }
 .chart-tip-date { font-size: 0.72rem; margin-top: 0.1rem; }
 .chart-legend { display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
+.view-selector { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin: 0.2rem 0 0.9rem; }
+.vchip {
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--dim);
+  font-size: 0.8rem; padding: 0.35rem 0.75rem; border-radius: 8px; cursor: pointer;
+  font-family: inherit; transition: all 0.15s;
+}
+.vchip:hover:not(:disabled) { color: var(--text); }
+.vchip.active { background: #1f6feb22; border-color: #1f6feb; color: #58a6ff; }
+.vchip:disabled { opacity: 0.4; cursor: not-allowed; }
+.view-hint { font-size: 0.78rem; }
 .spy-toggle {
   display: flex; align-items: center; gap: 0.4rem; background: var(--panel-2);
   border: 1px solid var(--line); color: var(--text); font-size: 0.8rem;

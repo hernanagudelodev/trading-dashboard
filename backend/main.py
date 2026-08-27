@@ -19,6 +19,12 @@ from db import query
 
 app = FastAPI(title="Trading Dashboard API", version="0.1.0")
 
+# Worker-API: servicio interno (red privada Railway) que calcula el rendimiento
+# ajustado por flujos (TWR) y el P&L real. El dashboard NO duplica esa logica —
+# la consume. Hostname interno + token compartido por env var.
+WORKER_API_URL   = os.getenv("WORKER_API_URL", "http://tradingworker.railway.internal:8080")
+WORKER_API_TOKEN = os.getenv("WORKER_API_TOKEN", "")
+
 # CORS: el front (React) corre en otro puerto (5173) y necesita permiso para
 # consultar este backend (8000). En dev abrimos todo; en prod se restringe.
 # CORS: en dev abrimos todo; en prod se restringe a la URL del frontend via
@@ -289,6 +295,37 @@ def get_equity(days: int = 90, from_date: str = None, to_date: str = None,
         "points":    len(series),
     }
     return {"series": series, "summary": summary}
+
+
+@app.get("/api/twr")
+def get_twr(days: int = 90, from_date: str = None, to_date: str = None,
+            _auth: bool = Depends(require_auth)):
+    """
+    Rendimiento ajustado por flujos (TWR %) + P&L real acumulado ($), calculado
+    por la worker-api (servicio interno con la logica en trade.py). El dashboard
+    NO duplica la formula — la consume. Degradacion suave: si la worker-api no
+    responde, devuelve disponible=False y el front cae a la curva de NLV cruda.
+    """
+    import urllib.request, urllib.parse, json as _json
+
+    qs = {"days": days}
+    if from_date: qs["from_date"] = from_date
+    if to_date:   qs["to_date"]   = to_date
+    url = f"{WORKER_API_URL}/twr?" + urllib.parse.urlencode(qs)
+
+    req = urllib.request.Request(url)
+    if WORKER_API_TOKEN:
+        req.add_header("X-Internal-Token", WORKER_API_TOKEN)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read())
+        data["available"] = True
+        return data
+    except Exception as e:
+        # La worker-api no respondio: el dashboard sigue, el front usa NLV crudo.
+        return {"available": False, "error": f"worker-api no disponible ({type(e).__name__})",
+                "twr_pct": None, "series": [], "pnl_series": [], "pnl_real": None,
+                "net_flows": None, "raw_change": None}
 
 
 # close_reasons que NO cuentan: trades del sistema viejo o correcciones manuales
