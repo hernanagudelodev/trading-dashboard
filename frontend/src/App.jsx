@@ -39,13 +39,29 @@ const fmt = (n, d = 0) =>
 const money = (n, d = 0) => (n == null ? "—" : (n < 0 ? "-$" : "$") + fmt(Math.abs(n), d));
 const signed = (n, d = 0) => (n == null ? "—" : (n >= 0 ? "+" : "-") + "$" + fmt(Math.abs(n), d));
 
-// Semáforo funcional: refleja el estado que el monitor ya calculó.
-const LEVEL = {
-  ACTION: { dot: "#3fb950", label: "acción", glow: "rgba(63,185,80,0.15)" },
-  WATCH:  { dot: "#d29922", label: "vigilar", glow: "rgba(210,153,34,0.12)" },
-  NORMAL: { dot: "#3d444d", label: "normal", glow: "transparent" },
+// Semáforo funcional. El color cruza DOS ejes: DIRECCIÓN (signo del P&L) y
+// URGENCIA (alert_level que ya calculó el monitor). El backend puede mandar
+// NORMAL/WATCH/ACTION/URGENT; el mismo nivel se dispara ganando (take profit) o
+// perdiendo (stop), así que el nivel solo no alcanza — hay que cruzarlo con el
+// signo para no pintar igual una ganadora al 70% (tomar ganancia) que un stop.
+//   ganando (WATCH/ACTION) -> verde ; ganando URGENT -> verde + glow (tomar ya)
+//   perdiendo (WATCH/ACTION) -> amarillo ; perdiendo URGENT -> rojo + glow (stop)
+//   NORMAL, o sin pnl_pct (sin precio) -> gris, nunca un color que mienta.
+const SEM = { gris: "#3d444d", verde: "#3fb950", amarillo: "#d29922", rojo: "#f85149" };
+const GLOW = { "#3fb950": "rgba(63,185,80,0.15)", "#f85149": "rgba(248,81,73,0.15)" };
+
+const levelOf = (p) => {
+  const lvl = p.alert_level;
+  if (!lvl || lvl === "NORMAL" || p.pnl_pct == null) {
+    return { dot: SEM.gris, glow: "transparent", urgent: false, label: "normal" };
+  }
+  const ganando = p.pnl_pct >= 0;
+  const urgent  = lvl === "URGENT";
+  const dot = ganando ? SEM.verde : (urgent ? SEM.rojo : SEM.amarillo);
+  const label = ganando ? (urgent ? "tomar ganancia" : "ganando")
+                        : (urgent ? "stop" : "vigilar");
+  return { dot, glow: urgent ? GLOW[dot] : "transparent", urgent, label };
 };
-const levelOf = (p) => LEVEL[p.alert_level] || LEVEL.NORMAL;
 
 function Pulse({ book }) {
   const e = book.exposure;
@@ -94,7 +110,7 @@ function PositionCard({ p, onClick }) {
     <div className="pcard" style={{ borderLeftColor: lv.dot }} onClick={onClick}>
       <div className="pcard-head">
         <div className="pcard-tk">
-          <span className="dot" style={{ background: lv.dot }} />
+          <span className="dot" style={{ background: lv.dot, boxShadow: lv.urgent ? `0 0 6px ${lv.dot}` : "none" }} />
           <span className="mono ticker">{p.ticker}</span>
           <span className="mono dim pcard-type">{p.type} {p.strike_low}/{p.strike_high}</span>
         </div>
@@ -123,7 +139,7 @@ function PositionRow({ p, onClick }) {
   return (
     <tr style={{ background: lv.glow, cursor: onClick ? "pointer" : "default" }} onClick={onClick}>
       <td>
-        <span className="dot" style={{ background: lv.dot }} />
+        <span className="dot" style={{ background: lv.dot, boxShadow: lv.urgent ? `0 0 6px ${lv.dot}` : "none" }} />
       </td>
       <td className="mono ticker">{p.ticker}</td>
       <td className="mono dim">{p.type}</td>
@@ -990,8 +1006,10 @@ export default function Dashboard() {
       <footer className="foot">
         <span>datos del último sync del monitor · máx 5 min de antigüedad</span>
         <div className="legend">
-          <span><span className="dot" style={{ background: "#3fb950" }} /> acción</span>
+          <span><span className="dot" style={{ background: "#3fb950" }} /> ganando</span>
+          <span><span className="dot" style={{ background: "#3fb950", boxShadow: "0 0 6px #3fb950" }} /> tomar ganancia</span>
           <span><span className="dot" style={{ background: "#d29922" }} /> vigilar</span>
+          <span><span className="dot" style={{ background: "#f85149", boxShadow: "0 0 6px #f85149" }} /> stop</span>
           <span><span className="dot" style={{ background: "#3d444d" }} /> normal</span>
         </div>
       </footer>
