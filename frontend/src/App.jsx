@@ -63,6 +63,31 @@ const levelOf = (p) => {
   return { dot, glow: urgent ? GLOW[dot] : "transparent", urgent, label };
 };
 
+function MarketBadge({ status, at }) {
+  // capital_at llega en UTC sin marca de tz (columna 'timestamp without time zone').
+  // Le agrego 'Z' para que el navegador lo parsee como UTC y lo muestre en hora local.
+  const snapMs = at ? new Date(at + "Z").getTime() : null;
+  const ageMin = snapMs ? (Date.now() - snapMs) / 60000 : Infinity;
+  const stale  = ageMin > 35;   // snapshot cada 5min (abierto) / 30 (cerrado); 35 = margen
+  const label  = (!status || stale) ? "desconocido" : status;
+  const color  = {
+    "Open":       "#3fb950",
+    "Closed":     "#8b949e",
+    "Pre-market": "#d29922",
+    "Extended":   "#d29922",
+  }[label] || "#6e7681";        // desconocido -> gris tenue
+  const hora = snapMs
+    ? new Date(snapMs).toLocaleString([], { dateStyle: "short", timeStyle: "short" })
+    : "—";
+  return (
+    <span className="market-badge" title={`mercado: ${label} · actualizado ${hora}`}>
+      <span className="dot" style={{ background: color }} />
+      <span className="market-badge-label">{label}</span>
+      <span className="capital-time">· {hora}</span>
+    </span>
+  );
+}
+
 function Pulse({ book }) {
   const e = book.exposure;
   const pnlPos = e.total_pnl >= 0;
@@ -957,6 +982,7 @@ export default function Dashboard() {
         <div className="capital">
           <span className="capital-label">capital</span>
           <span className="capital-value mono">{data ? money(data.capital, 2) : "—"}</span>
+          {data && <MarketBadge status={data.market_status} at={data.capital_at} />}
           <button className="logout" onClick={() => { clearToken(); setAuthed(false); }} title="Salir">⏻</button>
         </div>
       </header>
@@ -1060,6 +1086,8 @@ const CSS = `
 .capital-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); }
 .capital-value { font-size: 1.05rem; font-weight: 600; }
 .capital-time { font-size: 0.72rem; color: var(--dim); }
+.market-badge { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.72rem; color: var(--dim); }
+.market-badge-label { text-transform: capitalize; }
 
 .tabs { display: flex; gap: 0.4rem; padding: 1rem 1.6rem 0; }
 .tab {
