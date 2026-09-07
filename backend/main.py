@@ -83,15 +83,15 @@ def require_auth(authorization: str = Header(None)):
 
 
 def _capital_actual():
-    """Ultimo NLV registrado (account_snapshots)."""
+    """Ultimo NLV registrado (account_snapshots) + estado del mercado de esa fila."""
     rows = query("""
-        SELECT net_liquidating_value AS nlv, snapshot_at
+        SELECT net_liquidating_value AS nlv, snapshot_at, market_status
         FROM account_snapshots
         ORDER BY snapshot_at DESC LIMIT 1
     """)
     if not rows:
-        return None, None
-    return float(rows[0]["nlv"]), rows[0]["snapshot_at"]
+        return None, None, None
+    return float(rows[0]["nlv"]), rows[0]["snapshot_at"], rows[0]["market_status"]
 
 
 def _posiciones_abiertas(table):
@@ -173,10 +173,11 @@ def _serializar_libro(table, capital):
 @app.get("/api/positions")
 def get_positions(_auth: bool = Depends(require_auth)):
     """Posiciones abiertas de ambos libros + exposicion + capital."""
-    capital, snap_at = _capital_actual()
+    capital, snap_at, market_status = _capital_actual()
     return {
         "capital": capital,
         "capital_at": snap_at.isoformat() if snap_at else None,
+        "market_status": market_status,
         "live":  _serializar_libro("positions", capital),
         "paper": _serializar_libro("paper_positions", capital),
     }
