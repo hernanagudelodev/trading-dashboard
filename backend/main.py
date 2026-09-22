@@ -82,22 +82,38 @@ def require_auth(authorization: str = Header(None)):
     return True
 
 
-def _capital_actual():
-    """Ultimo NLV registrado (account_snapshots) + estado del mercado de esa fila."""
+def _market_status_now():
+    """Estado del mercado calculado por hora ET (v2 no lo guarda en el snapshot).
+    'open' en horario de sesion los dias habiles, si no 'closed'."""
+    try:
+        import datetime as dt
+        from zoneinfo import ZoneInfo
+        et = dt.datetime.now(dt.timezone.utc).astimezone(ZoneInfo("America/New_York"))
+        if et.weekday() >= 5:
+            return "closed"
+        mins = et.hour * 60 + et.minute
+        return "Open" if (9 * 60 + 30) <= mins < (16 * 60) else "Closed"
+    except Exception:
+        return None
+
+
+def _current_capital():
+    """Ultimo NLV registrado (account_snapshots) + estado del mercado (calculado por
+    hora ET, porque v2 no graba market_status en el snapshot)."""
     rows = query("""
-        SELECT net_liquidating_value AS nlv, snapshot_at, market_status
+        SELECT net_liquidating_value AS nlv, snapshot_at
         FROM account_snapshots
         ORDER BY snapshot_at DESC LIMIT 1
     """)
     if not rows:
         return None, None, None
-    return float(rows[0]["nlv"]), rows[0]["snapshot_at"], rows[0]["market_status"]
+    return float(rows[0]["nlv"]), rows[0]["snapshot_at"], _market_status_now()
 
 
-def _posiciones_abiertas(table):
+def _open_positions(table):
     """Posiciones OPEN de una tabla (positions|paper_positions), como dicts."""
     return query(f"""
-        SELECT id, ticker, strategy, sector, strike_low, strike_high,
+        SELECT id, ticker, strategy, strike_low, strike_high,
                contracts, expiration, premium_paid, total_cost,
                gross_pnl, pnl_pct, profit_pct_of_max,
                current_spread_value, current_value,
@@ -108,27 +124,36 @@ def _posiciones_abiertas(table):
     """)
 
 
-def _serializar_libro(table, capital):
+def _serialize_book(table, capital):
     """Arma {positions:[...], exposure:{...}} para un libro."""
-    rows = _posiciones_abiertas(table)
+    rows = _open_positions(table)
     positions = []
     total_pnl = 0.0
     total_max_loss = 0.0
 
+    # v2 es BIDIRECCIONAL: el tipo y el riesgo salen de la ESTRUCTURA (columna
+    # `strategy`), NO del signo del premium (que solo distinguia debito/credito y
+    # confundia Bear con Bull). Estructuras: Bull/Bear Call/Put Spread, Long Call/Put.
+    _CREDIT = ("Bull Put Spread", "Bear Call Spread")   # se abre cobrando
+    _LONG   = ("Long Call", "Long Put")                 # 1 pata, sin strike_high
     for r in rows:
-        prem = float(r["premium_paid"] or 0)
+        strategy = r["strategy"] or ""
         sl   = float(r["strike_low"] or 0)
-        sh   = float(r["strike_high"] or 0)
+        sh   = float(r["strike_high"]) if r["strike_high"] is not None else None
         ctr  = int(r["contracts"] or 1)
-        # El signo del premium decide el tipo: <0 credito (BPS), >0 debito (BCS)
-        is_bps = prem < 0
-        tipo = "BPS" if is_bps else "BCS"
-        # Max loss: para BCS = costo (debito pagado); para BPS = (ancho - credito)
-        ancho = (sh - sl) * 100 * ctr
-        if is_bps:
-            max_loss = ancho - abs(float(r["total_cost"] or 0))
+        cost = abs(float(r["total_cost"] or 0))
+        is_long   = strategy in _LONG
+        is_credit = strategy in _CREDIT
+
+        # Max loss por estructura:
+        #   Long (1 pata): la prima pagada (total_cost).
+        #   Debito (Bull Call / Bear Put): el debito pagado (total_cost).
+        #   Credito (Bull Put / Bear Call): width del spread - credito recibido.
+        if is_long or not is_credit:
+            max_loss = cost
         else:
-            max_loss = float(r["total_cost"] or 0)
+            width = abs(sh - sl) * 100 * ctr if sh is not None else 0
+            max_loss = width - cost
         total_max_loss += max_loss
         pnl = float(r["gross_pnl"]) if r["gross_pnl"] is not None else None
         if pnl is not None:
@@ -137,8 +162,8 @@ def _serializar_libro(table, capital):
         positions.append({
             "id": r["id"],
             "ticker": r["ticker"],
-            "type": tipo,
-            "sector": r["sector"],
+            "type": strategy,
+            "sector": None,
             "strike_low": sl,
             "strike_high": sh,
             "contracts": ctr,
@@ -173,13 +198,13 @@ def _serializar_libro(table, capital):
 @app.get("/api/positions")
 def get_positions(_auth: bool = Depends(require_auth)):
     """Posiciones abiertas de ambos libros + exposicion + capital."""
-    capital, snap_at, market_status = _capital_actual()
+    capital, snap_at, market_status = _current_capital()
     return {
         "capital": capital,
         "capital_at": snap_at.isoformat() if snap_at else None,
         "market_status": market_status,
-        "live":  _serializar_libro("positions", capital),
-        "paper": _serializar_libro("paper_positions", capital),
+        "live":  _serialize_book("positions", capital),
+        "paper": _serialize_book("paper_positions", capital),
     }
 
 
@@ -192,10 +217,11 @@ def get_spy(days: int = 90, from_date: str = None, to_date: str = None,
     normalizacion (a % desde el inicio) la hace el frontend, para alinearla con
     el primer punto real del NLV.
 
-    Endpoint SEPARADO a proposito: si yfinance falla, /api/equity sigue OK y la
-    curva de patrimonio se dibuja sin el benchmark (degradacion suave).
+    v2: lee de candle_daily (fuente unica, Tastytrade) en vez de yfinance. Si no
+    hay velas de SPY en el rango, devuelve series vacia (degradacion suave: la
+    curva de patrimonio se dibuja igual, sin el benchmark).
     """
-    from datetime import datetime, timedelta, date as _date
+    from datetime import timedelta, date as _date
     # Resolver el rango de fechas
     if from_date or to_date:
         start = from_date or (_date.today() - timedelta(days=3650)).isoformat()
@@ -205,15 +231,19 @@ def get_spy(days: int = 90, from_date: str = None, to_date: str = None,
         end   = _date.today().isoformat()
 
     try:
-        import yfinance as yf
-        # end + 1 dia para incluir el ultimo dia
-        end_plus = (datetime.fromisoformat(end).date() + timedelta(days=1)).isoformat()
-        hist = yf.Ticker("SPY").history(start=start, end=end_plus, interval="1d")
-        if hist is None or hist.empty:
+        rows = query("""
+            SELECT candle_date, close
+            FROM candle_daily
+            WHERE ticker = 'SPY'
+              AND candle_date >= %s AND candle_date <= %s
+              AND close IS NOT NULL
+            ORDER BY candle_date
+        """, (start, end))
+        if not rows:
             return {"series": [], "error": "sin datos de SPY en el rango"}
         series = [
-            {"t": idx.date().isoformat(), "close": round(float(row["Close"]), 2)}
-            for idx, row in hist.iterrows()
+            {"t": r["candle_date"].isoformat(), "close": round(float(r["close"]), 2)}
+            for r in rows
         ]
         return {"series": series, "error": None}
     except Exception as e:
@@ -334,7 +364,7 @@ def get_twr(days: int = 90, from_date: str = None, to_date: str = None,
 CLOSED_EXCLUDE = ("PRE_RULES", "INVALID_STRIKES", "MANUAL_PRICE_FIX")
 
 
-def _closed_libro(table, since):
+def _closed_book(table, since):
     rows = query(f"""
         SELECT ticker, strategy, close_reason, gross_pnl, pnl_pct, closed_at
         FROM {table}
@@ -392,20 +422,20 @@ def get_closed(since: str = "2026-06-20", _auth: bool = Depends(require_auth)):
     """
     return {
         "since": since,
-        "live":  _closed_libro("positions", since),
-        "paper": _closed_libro("paper_positions", since),
+        "live":  _closed_book("positions", since),
+        "paper": _closed_book("paper_positions", since),
     }
 
 
 @app.get("/api/runs")
 def get_runs(limit: int = 30, _auth: bool = Depends(require_auth)):
     """
-    Ultimos runs del auto_run (que decidio el LLM y por que). Lee auto_run_logs.
-    En def los runs son mode='def' (un run cubre ambos libros).
+    Ultimos runs del auto_run. Lee auto_run_logs (esquema v2: sin los campos del
+    LLM viejo de def; con regime/candidates/net_delta).
     """
     rows = query("""
-        SELECT run_at, slot, verdict, vix, opened, closed, errors,
-               summary, no_trade_reason, run_time_sec, mode
+        SELECT run_at, slot, regime, candidates, opened, net_delta,
+               summary, run_time_sec, mode
         FROM auto_run_logs
         ORDER BY run_at DESC
         LIMIT %s
@@ -416,15 +446,20 @@ def get_runs(limit: int = 30, _auth: bool = Depends(require_auth)):
         runs.append({
             "run_at": r["run_at"].isoformat() if r["run_at"] else None,
             "slot": r["slot"],
-            "verdict": r["verdict"],
-            "vix": float(r["vix"]) if r["vix"] is not None else None,
+            # v2 no tiene 'verdict' (LLM); el regimen del scan es lo equivalente.
+            "verdict": r["regime"],
+            "vix": None,                      # v2 no lo guarda como columna del log
             "opened": r["opened"],
-            "closed": r["closed"],
-            "errors": r["errors"],
+            "closed": None,                   # v2 no cuenta cierres en el log
+            "errors": None,
             "summary": r["summary"],
-            "no_trade_reason": r["no_trade_reason"],
+            "no_trade_reason": None,
             "run_time_sec": r["run_time_sec"],
             "mode": r["mode"],
+            # extras de v2 (el front los usa si quiere; si no, los ignora)
+            "regime": r["regime"],
+            "candidates": r["candidates"],
+            "net_delta": float(r["net_delta"]) if r["net_delta"] is not None else None,
         })
     return {"runs": runs}
 
@@ -432,23 +467,23 @@ def get_runs(limit: int = 30, _auth: bool = Depends(require_auth)):
 @app.get("/api/positions/{book}/{pos_id}/detail")
 def get_position_detail(book: str, pos_id: int, _auth: bool = Depends(require_auth)):
     """
-    Detalle de UNA posicion para el modal: datos de la posicion, el rationale +
-    contexto del LLM (trade_context), y la serie de precio del subyacente
-    (yfinance, desde opened_at - 5 dias hasta hoy) con los strikes de referencia.
+    Detalle de UNA position para el modal: datos de la position, el rationale +
+    context del LLM (trade_context), y la serie de price del subyacente
+    (candle_daily, desde opened_at - 5 dias hasta hoy) con los strikes de referencia.
 
     book: 'live' (positions) o 'paper' (paper_positions).
     """
     table = "positions" if book == "live" else "paper_positions"
     ctx_fk = "position_id" if book == "live" else "paper_position_id"
 
-    # 1. La posicion. OJO con los nombres reales de columna (ver _serializar_libro):
+    # 1. La position. OJO con los nombres reales de columna (ver _serialize_book):
     #    pnl real = gross_pnl; alert_level real = last_alert_level; max_loss se
     #    CALCULA (no es columna); current_value no se usa aca.
     rows = query(f"""
-        SELECT id, ticker, strike_low, strike_high, expiration,
+        SELECT id, ticker, strategy, strike_low, strike_high, expiration,
                premium_paid, total_cost, contracts, opened_at, price_at_open,
                status, last_alert_level, gross_pnl, pnl_pct,
-               profit_pct_of_max, sector
+               profit_pct_of_max
         FROM {table}
         WHERE id = %s
     """, (pos_id,))
@@ -456,18 +491,23 @@ def get_position_detail(book: str, pos_id: int, _auth: bool = Depends(require_au
         raise HTTPException(404, "Posicion no encontrada.")
     p = rows[0]
 
-    # max_loss: mismo criterio que _serializar_libro (signo del premium decide tipo)
-    prem = float(p["premium_paid"] or 0)
+    # max_loss por ESTRUCTURA (columna strategy), mismo criterio que _serialize_book.
+    _CREDIT = ("Bull Put Spread", "Bear Call Spread")
+    _LONG   = ("Long Call", "Long Put")
+    strategy = p["strategy"] or ""
     sl   = float(p["strike_low"] or 0)
-    sh   = float(p["strike_high"] or 0)
+    sh   = float(p["strike_high"]) if p["strike_high"] is not None else None
     ctr  = int(p["contracts"] or 1)
-    is_bps = prem < 0
-    ancho = (sh - sl) * 100 * ctr
-    max_loss = (ancho - abs(float(p["total_cost"] or 0))) if is_bps else float(p["total_cost"] or 0)
+    cost = abs(float(p["total_cost"] or 0))
+    if strategy in _LONG or strategy not in _CREDIT:
+        max_loss = cost
+    else:
+        width = abs(sh - sl) * 100 * ctr if sh is not None else 0
+        max_loss = width - cost
 
-    posicion = {
+    position = {
         "id": p["id"], "ticker": p["ticker"],
-        "type": "BPS" if is_bps else "BCS",
+        "type": strategy,
         "strike_low": sl, "strike_high": sh,
         "expiration": p["expiration"].isoformat() if p["expiration"] else None,
         "opened_at": p["opened_at"].isoformat() if p["opened_at"] else None,
@@ -477,11 +517,11 @@ def get_position_detail(book: str, pos_id: int, _auth: bool = Depends(require_au
         "pnl": float(p["gross_pnl"]) if p["gross_pnl"] is not None else None,
         "pnl_pct": float(p["pnl_pct"]) if p["pnl_pct"] is not None else None,
         "profit_pct_of_max": float(p["profit_pct_of_max"]) if p["profit_pct_of_max"] is not None else None,
-        "alert_level": p["last_alert_level"], "sector": p["sector"],
+        "alert_level": p["last_alert_level"], "sector": None,
         "status": p["status"], "contracts": ctr,
     }
 
-    # 2. El contexto del LLM (rationale + campos ricos), si existe
+    # 2. El context del LLM (rationale + campos ricos), si existe
     ctx_rows = query(f"""
         SELECT claude_rationale, price_at_signal, rsi, iv, iv_percentile,
                vix, spy_trend_25d, macro_verdict, trend_25d_pct, beta,
@@ -490,10 +530,10 @@ def get_position_detail(book: str, pos_id: int, _auth: bool = Depends(require_au
         WHERE {ctx_fk} = %s
         ORDER BY id DESC LIMIT 1
     """, (pos_id,))
-    contexto = None
+    context = None
     if ctx_rows:
         c = ctx_rows[0]
-        contexto = {
+        context = {
             "rationale": c["claude_rationale"],
             "rsi": c["rsi"], "iv": c["iv"], "iv_percentile": c["iv_percentile"],
             "vix": c["vix"], "spy_trend_25d": c["spy_trend_25d"],
@@ -501,29 +541,32 @@ def get_position_detail(book: str, pos_id: int, _auth: bool = Depends(require_au
             "beta": c["beta"], "strategy_reason": c["strategy_reason"],
         }
 
-    # 3. Serie de precio del subyacente (yfinance), desde opened_at - 5 dias.
-    #    El backend del dashboard trae su propia data (independiente del worker).
-    #    Si yfinance falla, el modal igual muestra 1 y 2 — el grafico es opcional.
-    serie = None
-    serie_error = None
+    # 3. Serie de price del subyacente desde candle_daily (fuente unica), desde
+    #    opened_at - 5 dias. Si no hay velas del ticker, el modal igual muestra 1 y 2
+    #    — el grafico es opcional (degradacion suave).
+    series = None
+    series_error = None
     try:
-        import yfinance as yf
         from datetime import timedelta, date
         start = (p["opened_at"].date() - timedelta(days=5)) if p["opened_at"] else (date.today() - timedelta(days=45))
-        hist = yf.Ticker(p["ticker"]).history(start=start.isoformat(), interval="1d")
-        if hist is not None and not hist.empty:
-            serie = [
-                {"date": idx.date().isoformat(), "close": round(float(row["Close"]), 2)}
-                for idx, row in hist.iterrows()
+        hist = query("""
+            SELECT candle_date, close FROM candle_daily
+            WHERE ticker = %s AND candle_date >= %s AND close IS NOT NULL
+            ORDER BY candle_date
+        """, (p["ticker"], start.isoformat()))
+        if hist:
+            series = [
+                {"date": r["candle_date"].isoformat(), "close": round(float(r["close"]), 2)}
+                for r in hist
             ]
     except Exception as e:
-        serie_error = f"no se pudo cargar el historico ({type(e).__name__})"
+        series_error = f"no se pudo cargar el historico ({type(e).__name__})"
 
     return {
-        "posicion": posicion,
-        "contexto": contexto,
-        "serie": serie,
-        "serie_error": serie_error,
+        "position": position,
+        "context": context,
+        "series": series,
+        "series_error": series_error,
     }
 
 

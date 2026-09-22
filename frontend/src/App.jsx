@@ -384,7 +384,7 @@ function EquityCurve() {
   const fmtDate = (iso) => iso.slice(5, 10);
   const fmtDateFull = (iso) => iso.slice(0, 10);
 
-  // ── Elegir la serie a graficar según la vista ────────────────────────────────
+  // ── Elegir la series a graficar según la vista ────────────────────────────────
   // pnl: ganancia real acumulada ($, sin saltos por flujos) — la vista principal
   // nlv: NLV crudo ($, salta con depósitos) — "cuánta plata hay"
   // twr: rendimiento acumulado (%, inmune al capital) — puede comparar vs SPY
@@ -426,7 +426,7 @@ function EquityCurve() {
     spyLine = spyPct.map((v, i) => `${i === 0 ? "M" : "L"} ${px(i, spyPct.length).toFixed(1)} ${pyP(v).toFixed(1)}`).join(" ");
   }
 
-  // Tooltip: del evento al índice más cercano (sobre la serie graficada).
+  // Tooltip: del evento al índice más cercano (sobre la series graficada).
   const onMove = (e) => {
     const svg = e.currentTarget;
     const rect = svg.getBoundingClientRect();
@@ -784,21 +784,21 @@ function Login({ onOk }) {
   );
 }
 
-// ── Modal de detalle de una posicion ─────────────────────────────────────────
-// Carga /api/positions/{book}/{id}/detail: datos, contexto (rationale del LLM) y
-// la serie de precio del subyacente (yfinance). Dibuja el precio con SVG y las
+// ── Modal de detalle de una position ─────────────────────────────────────────
+// Carga /api/positions/{book}/{id}/detail: datos, context (rationale del LLM) y
+// la series de precio del subyacente (candle_daily). Dibuja el precio con SVG y las
 // lineas de referencia (strikes + precio de apertura).
-function SubyacenteChart({ serie, strikeLow, strikeHigh, priceOpen }) {
-  if (!serie || serie.length < 2) return null;
+function UnderlyingChart({ series, strikeLow, strikeHigh, priceOpen }) {
+  if (!series || series.length < 2) return null;
   const W = 560, H = 240, PADL = 52, PADR = 60, PADT = 20, PADB = 30;
-  const closes = serie.map((p) => p.close);
+  const closes = series.map((p) => p.close);
   // El rango incluye los strikes para que las lineas de referencia entren.
   const vals = [...closes, strikeLow, strikeHigh, priceOpen].filter((v) => v != null);
   const minY = Math.min(...vals), maxY = Math.max(...vals);
   const rangeY = maxY - minY || 1;
-  const px = (i) => PADL + (i / (serie.length - 1 || 1)) * (W - PADL - PADR);
+  const px = (i) => PADL + (i / (series.length - 1 || 1)) * (W - PADL - PADR);
   const py = (v) => PADT + (1 - (v - minY) / rangeY) * (H - PADT - PADB);
-  const line = serie.map((p, i) => `${i === 0 ? "M" : "L"} ${px(i).toFixed(1)} ${py(p.close).toFixed(1)}`).join(" ");
+  const line = series.map((p, i) => `${i === 0 ? "M" : "L"} ${px(i).toFixed(1)} ${py(p.close).toFixed(1)}`).join(" ");
   const last = closes[closes.length - 1];
   const first = closes[0];
   const up = last >= first;
@@ -840,10 +840,10 @@ function SubyacenteChart({ serie, strikeLow, strikeHigh, priceOpen }) {
       {/* linea de precio */}
       <path d={line} fill="none" stroke={lineColor} strokeWidth="1.8" />
       {/* punto final */}
-      <circle cx={px(serie.length - 1)} cy={py(last)} r="3" fill={lineColor} />
+      <circle cx={px(series.length - 1)} cy={py(last)} r="3" fill={lineColor} />
       {/* etiquetas de fecha (primera y ultima) */}
-      <text x={PADL} y={H - 8} fill="#6e7681" fontSize="9">{fmtD(serie[0].date)}</text>
-      <text x={W - PADR} y={H - 8} fill="#6e7681" fontSize="9" textAnchor="end">{fmtD(serie[serie.length - 1].date)}</text>
+      <text x={PADL} y={H - 8} fill="#6e7681" fontSize="9">{fmtD(series[0].date)}</text>
+      <text x={W - PADR} y={H - 8} fill="#6e7681" fontSize="9" textAnchor="end">{fmtD(series[series.length - 1].date)}</text>
     </svg>
   );
 }
@@ -866,8 +866,8 @@ function PositionModal({ book, posId, onClose }) {
         {error && <div className="state">No se pudo cargar el detalle ({error}).</div>}
         {!error && !detail && <div className="state">Cargando detalle…</div>}
         {detail && (() => {
-          const p = detail.posicion;
-          const c = detail.contexto;
+          const p = detail.position;
+          const c = detail.context;
           const pnlPos = (p.pnl ?? 0) >= 0;
           return (
             <>
@@ -884,15 +884,15 @@ function PositionModal({ book, posId, onClose }) {
               {/* Grafico del subyacente */}
               <div className="modal-section">
                 <div className="modal-section-title">precio del subyacente</div>
-                {detail.serie
-                  ? <SubyacenteChart serie={detail.serie} strikeLow={p.strike_low}
+                {detail.series
+                  ? <UnderlyingChart series={detail.series} strikeLow={p.strike_low}
                       strikeHigh={p.strike_high} priceOpen={p.price_at_open} />
                   : <div className="dim" style={{ fontSize: "0.8rem", padding: "1rem 0" }}>
-                      {detail.serie_error || "sin datos de precio"}
+                      {detail.series_error || "sin datos de precio"}
                     </div>}
               </div>
 
-              {/* Datos de la posicion */}
+              {/* Datos de la position */}
               <div className="modal-section">
                 <div className="modal-grid">
                   <div><span className="dim">costo</span><br/>{money(p.total_cost)}</div>
@@ -919,7 +919,7 @@ function PositionModal({ book, posId, onClose }) {
                       </div>
                     </>
                   : <div className="dim" style={{ fontSize: "0.8rem" }}>
-                      Sin rationale guardado (posición abierta antes del registro de contexto).
+                      Sin rationale guardado (posición abierta antes del registro de context).
                     </div>}
               </div>
             </>
@@ -937,7 +937,7 @@ export default function Dashboard() {
   const [tab, setTab] = useState("live");
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
-  const [modalPos, setModalPos] = useState(null);   // {book, id} de la posicion abierta en el modal
+  const [modalPos, setModalPos] = useState(null);   // {book, id} de la position abierta en el modal
 
   const load = () => {
     authFetch(`/api/positions`)
