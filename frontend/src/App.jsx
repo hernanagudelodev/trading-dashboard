@@ -763,7 +763,7 @@ function Login({ onOk }) {
       <div className="login-card">
         <div className="login-brand">
           <span className="brand-mark" />
-          <span className="brand-name">bull<span className="brand-accent">desk</span></span>
+          <span className="brand-name">bull<span className="brand-accent">desk</span> v2</span>
         </div>
         <p className="login-hint">Panel de trading privado</p>
         <input
@@ -965,7 +965,7 @@ export default function Dashboard() {
             {menuOpen ? "✕" : "☰"}
           </button>
           <span className="brand-mark" />
-          <span className="brand-name">bull<span className="brand-accent">desk</span></span>
+          <span className="brand-name">bull<span className="brand-accent">desk</span> v2</span>
         </div>
         <nav className={menuOpen ? "nav open" : "nav"}>
           {["positions", "equity", "closed", "runs"].map((v) => {
